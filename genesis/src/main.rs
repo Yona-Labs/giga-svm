@@ -45,8 +45,10 @@ use {
         process,
         str::FromStr,
         time::Duration,
-    },
+    }
 };
+
+use solana_inline_spl::token::native_mint;
 
 pub enum AccountFileFormat {
     Pubkey,
@@ -690,6 +692,15 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             );
         }
     }
+
+    let native_mint_account = AccountSharedData::from(Account {
+        owner: solana_inline_spl::token::id(),
+        data: native_mint::ACCOUNT_DATA.to_vec(),
+        lamports: sol_to_lamports(1.),
+        executable: false,
+        rent_epoch: 1,
+    });
+    genesis_config.add_account(native_mint::id(), native_mint_account);
 
     solana_logger::setup();
     create_new_ledger(
