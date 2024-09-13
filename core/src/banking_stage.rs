@@ -723,6 +723,7 @@ impl BankingStage {
                     let before_process = Instant::now();
                     consumer.process_packets_transactions(&bank_start.working_bank, &bank_start.bank_creation_time, &tx_buffer, &banking_stage_stats, &mut slot_metrics_tracker);
                     datapoint_info!("process-packets-transactions", ("process_time", before_process.elapsed().as_micros() as i64, i64));
+                    datapoint_info!("bank-process_transactions", ("tx_count", tx_buffer.len() as i64, i64));
                     tx_buffer.clear();
                 }
             })

@@ -27,7 +27,7 @@ use solana_sdk_macro::CloneZeroed;
 /// The default tick rate that the cluster attempts to achieve (160 per second).
 ///
 /// Note that the actual tick rate at any given time should be expected to drift.
-pub const DEFAULT_TICKS_PER_SECOND: u64 = 1000;
+pub const DEFAULT_TICKS_PER_SECOND: u64 = 2000;
 
 #[cfg(test)]
 static_assertions::const_assert_eq!(MS_PER_TICK, 6);
