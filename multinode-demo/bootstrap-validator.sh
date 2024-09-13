@@ -183,6 +183,7 @@ trap 'kill_node_and_exit' INT TERM ERR
 
 while true; do
   echo "$program ${args[*]}"
+  exit 0;
   $program "${args[@]}" &
   pid=$!
   echo "pid: $pid"
