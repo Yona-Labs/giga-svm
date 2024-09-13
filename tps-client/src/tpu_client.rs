@@ -18,6 +18,7 @@ use {
     solana_tpu_client::tpu_client::TpuClient,
     solana_transaction_status::UiConfirmedBlock,
 };
+use solana_transaction_status::TransactionStatus;
 
 impl<P, M, C> TpsClient for TpuClient<P, M, C>
 where
@@ -180,5 +181,9 @@ where
         self.rpc_client()
             .get_block_with_config(slot, rpc_block_config)
             .map_err(|err| err.into())
+    }
+
+    fn get_signature_statuses(&self, signatures: Vec<Signature>) -> TpsClientResult<Vec<Option<TransactionStatus>>> {
+        todo!()
     }
 }

@@ -22,6 +22,7 @@ use {
     },
     thiserror::Error,
 };
+use solana_transaction_status::TransactionStatus;
 
 #[derive(Error, Debug)]
 pub enum TpsClientError {
@@ -143,6 +144,8 @@ pub trait TpsClient {
         slot: Slot,
         rpc_block_config: RpcBlockConfig,
     ) -> TpsClientResult<UiConfirmedBlock>;
+
+    fn get_signature_statuses(&self, signatures: Vec<Signature>) -> TpsClientResult<Vec<Option<TransactionStatus>>>;
 }
 
 mod bank_client;

@@ -16,6 +16,7 @@ use {
     },
     solana_transaction_status::UiConfirmedBlock,
 };
+use solana_transaction_status::TransactionStatus;
 
 impl TpsClient for BankClient {
     fn send_transaction(&self, transaction: Transaction) -> TpsClientResult<Signature> {
@@ -141,5 +142,9 @@ impl TpsClient for BankClient {
         _rpc_block_config: RpcBlockConfig,
     ) -> TpsClientResult<UiConfirmedBlock> {
         unimplemented!("BankClient doesn't support get_block_with_config");
+    }
+
+    fn get_signature_statuses(&self, signatures: Vec<Signature>) -> TpsClientResult<Vec<Option<TransactionStatus>>> {
+        todo!()
     }
 }

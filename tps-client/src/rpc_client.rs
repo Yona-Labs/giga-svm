@@ -15,6 +15,7 @@ use {
     },
     solana_transaction_status::UiConfirmedBlock,
 };
+use solana_transaction_status::TransactionStatus;
 
 impl TpsClient for RpcClient {
     fn send_transaction(&self, transaction: Transaction) -> TpsClientResult<Signature> {
@@ -145,5 +146,9 @@ impl TpsClient for RpcClient {
         rpc_block_config: RpcBlockConfig,
     ) -> TpsClientResult<UiConfirmedBlock> {
         RpcClient::get_block_with_config(self, slot, rpc_block_config).map_err(|err| err.into())
+    }
+
+    fn get_signature_statuses(&self, signatures: Vec<Signature>) -> TpsClientResult<Vec<Option<TransactionStatus>>> {
+        RpcClient::get_signature_statuses(self, &signatures).map(|response| response.value).map_err(|err| err.into())
     }
 }

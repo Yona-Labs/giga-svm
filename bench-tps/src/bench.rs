@@ -1,3 +1,5 @@
+use std::thread::spawn;
+use rand::prelude::SliceRandom;
 use {
     crate::{
         cli::{ComputeUnitPrice, Config, InstructionPaddingConfig},
@@ -41,6 +43,7 @@ use {
         time::{Duration, Instant},
     },
 };
+use solana_transaction_status::TransactionConfirmationStatus;
 
 // The point at which transactions become "too old", in seconds.
 const MAX_TX_QUEUE_AGE: u64 = (MAX_PROCESSING_AGE as f64 * DEFAULT_S_PER_SLOT) as u64;
@@ -942,7 +945,7 @@ fn poll_blockhash<T: TpsClient + ?Sized>(
     }
 }
 
-fn do_tx_transfers<T: TpsClient + ?Sized>(
+fn do_tx_transfers<T: TpsClient + Send + Sync + ?Sized + 'static>(
     exit_signal: &AtomicBool,
     shared_txs: &SharedTransactions,
     shared_tx_thread_count: &Arc<AtomicIsize>,
@@ -995,16 +998,45 @@ fn do_tx_transfers<T: TpsClient + ?Sized>(
                 );
             }
 
+            let sent_at = Utc::now();
+            let signature_to_measure = *signatures.choose(&mut rand::thread_rng()).unwrap();
             if let Some(signatures_sender) = &signatures_sender {
                 if let Err(error) = signatures_sender.send(TransactionInfoBatch {
                     signatures,
-                    sent_at: Utc::now(),
+                    sent_at,
                     compute_unit_prices,
                 }) {
                     error!("Receiver has been dropped with error `{error}`, stop sending transactions.");
                     break 'thread_loop;
                 }
             }
+
+            // measure one transaction latency from batch
+            spawn({
+                let client = client.clone();
+                move || {
+                    let mut current_status = None;
+                    loop {
+                        let mut status = client.get_signature_statuses(vec![signature_to_measure]).unwrap();
+                        match (current_status, status.remove(0).map(|stat| stat.confirmation_status)) {
+                            (None, Some(Some(TransactionConfirmationStatus::Confirmed))) => {
+                                current_status = Some(TransactionConfirmationStatus::Confirmed);
+                                let latency = Utc::now().signed_duration_since(sent_at).num_milliseconds();
+                                datapoint_info!("ext-tx-latency-confirmed", "txid" => signature_to_measure.to_string(), ("latency", latency, i64));
+                            },
+                            (Some(TransactionConfirmationStatus::Confirmed), Some(Some(TransactionConfirmationStatus::Finalized))) => {
+                                let latency = Utc::now().signed_duration_since(sent_at).num_milliseconds();
+                                datapoint_info!("ext-tx-latency-finalized\
+                                \
+                                ", "txid" => signature_to_measure.to_string(), ("latency", latency, i64));
+                                break;
+                            },
+                            (_, _) => {},
+                        }
+                        sleep(Duration::from_millis(10));
+                    }
+                }
+            });
 
             if let Err(error) = client.send_batch(transactions) {
                 warn!("send_batch_sync in do_tx_transfers failed: {}", error);
