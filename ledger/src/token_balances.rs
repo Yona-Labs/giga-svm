@@ -40,14 +40,14 @@ pub fn collect_token_balances(
     batch: &TransactionBatch,
     mint_decimals: &mut HashMap<Pubkey, u8>,
 ) -> TransactionTokenBalances {
-    let mut balances: TransactionTokenBalances = vec![];
+    let mut balances: TransactionTokenBalances = Vec::with_capacity(batch.sanitized_transactions().len());
     let mut collect_time = Measure::start("collect_token_balances");
 
     for transaction in batch.sanitized_transactions() {
         let account_keys = transaction.message().account_keys();
         let has_token_program = account_keys.iter().any(is_known_spl_token_id);
 
-        let mut transaction_balances: Vec<TransactionTokenBalance> = vec![];
+        let mut transaction_balances: Vec<TransactionTokenBalance> = Vec::with_capacity(account_keys.len());
         if has_token_program {
             for (index, account_id) in account_keys.iter().enumerate() {
                 if transaction.message().is_invoked(index) || is_known_spl_token_id(account_id) {

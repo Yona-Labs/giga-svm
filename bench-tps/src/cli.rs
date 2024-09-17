@@ -94,7 +94,7 @@ impl Default for Config {
             duration: Duration::new(u64::MAX, 0),
             tx_count: 50_000,
             keypair_multiplier: 8,
-            thread_batch_sleep_ms: 1000,
+            thread_batch_sleep_ms: 100,
             sustained: false,
             client_ids_and_stake_file: String::new(),
             write_to_client_file: false,

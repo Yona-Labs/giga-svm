@@ -1,3 +1,4 @@
+use std::time::Instant;
 use {
     bincode::{deserialize, serialize},
     crossbeam_channel::{unbounded, Receiver, Sender},

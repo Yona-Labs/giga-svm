@@ -53,6 +53,7 @@ use {
     },
     tokio::sync::mpsc::Sender as AsyncSender,
 };
+use solana_sdk::transaction::SanitizedTransaction;
 
 // allow multiple connections for NAT and any open/close overlap
 pub const MAX_QUIC_CONNECTIONS_PER_PEER: usize = 8;
@@ -118,6 +119,7 @@ impl Tpu {
         block_production_method: BlockProductionMethod,
         enable_block_production_forwarding: bool,
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
+        receiver: Receiver<SanitizedTransaction>,
     ) -> (Self, Vec<Arc<dyn NotifyKeyUpdate + Sync + Send>>) {
         let TpuSockets {
             transactions: transactions_sockets,
@@ -247,6 +249,7 @@ impl Tpu {
             bank_forks.clone(),
             prioritization_fee_cache,
             enable_block_production_forwarding,
+            receiver,
         );
 
         let (entry_receiver, tpu_entry_notifier) =

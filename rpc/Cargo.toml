@@ -24,6 +24,7 @@ jsonrpc-http-server = { workspace = true }
 jsonrpc-pubsub = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+parking_lot = { workspace = true }
 rayon = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }

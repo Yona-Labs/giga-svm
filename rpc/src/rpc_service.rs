@@ -9,7 +9,7 @@ use {
         rpc_cache::LargestAccountsCache,
         rpc_health::*,
     },
-    crossbeam_channel::unbounded,
+    crossbeam_channel::{Sender, unbounded},
     jsonrpc_core::{futures::prelude::*, MetaIoHandler},
     jsonrpc_http_server::{
         hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
@@ -49,6 +49,7 @@ use {
     },
     tokio_util::codec::{BytesCodec, FramedRead},
 };
+use solana_sdk::transaction::SanitizedTransaction;
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
 const INCREMENTAL_SNAPSHOT_REQUEST_PATH: &str = "/incremental-snapshot.tar.bz2";
@@ -347,7 +348,7 @@ impl JsonRpcService {
         exit: Arc<AtomicBool>,
         override_health_check: Arc<AtomicBool>,
         startup_verification_complete: Arc<AtomicBool>,
-        optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        optimistically_confirmed_bank: Arc<parking_lot::RwLock<OptimisticallyConfirmedBank>>,
         send_transaction_service_config: send_transaction_service::Config,
         max_slots: Arc<MaxSlots>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
@@ -355,6 +356,7 @@ impl JsonRpcService {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+        rpc_tx_sender: Sender<SanitizedTransaction>,
     ) -> Result<Self, String> {
         info!("rpc bound to {:?}", rpc_addr);
         info!("rpc configuration: {:?}", config);
@@ -470,6 +472,7 @@ impl JsonRpcService {
             max_complete_transaction_status_slot,
             max_complete_rewards_slot,
             prioritization_fee_cache,
+            rpc_tx_sender,
         );
 
         let leader_info =

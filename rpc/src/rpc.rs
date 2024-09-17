@@ -2,7 +2,7 @@
 
 use std::thread::{sleep, Builder};
 use std::time::Instant;
-use crossbeam_channel::{bounded, RecvError, RecvTimeoutError};
+use crossbeam_channel::{bounded};
 use {
     crate::{
         filter::filter_allows, max_slots::MaxSlots,
@@ -211,16 +211,18 @@ pub struct JsonRpcRequestProcessor {
     cluster_info: Arc<ClusterInfo>,
     genesis_hash: Hash,
     transaction_sender: Arc<Mutex<Sender<TransactionInfo>>>,
-    transaction_latency_sender: Arc<Mutex<Sender<(Signature, Instant)>>>,
+    transaction_latency_sender: Arc<Mutex<Sender<Signature>>>,
     bigtable_ledger_storage: Option<solana_storage_bigtable::LedgerStorage>,
-    optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+    optimistically_confirmed_bank: Arc<parking_lot::RwLock<OptimisticallyConfirmedBank>>,
     largest_accounts_cache: Arc<RwLock<LargestAccountsCache>>,
     max_slots: Arc<MaxSlots>,
     leader_schedule_cache: Arc<LeaderScheduleCache>,
     max_complete_transaction_status_slot: Arc<AtomicU64>,
     max_complete_rewards_slot: Arc<AtomicU64>,
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+    rpc_tx_sender: Sender<SanitizedTransaction>,
 }
+
 impl Metadata for JsonRpcRequestProcessor {}
 
 impl JsonRpcRequestProcessor {
@@ -259,7 +261,6 @@ impl JsonRpcRequestProcessor {
             let bank = self
                 .optimistically_confirmed_bank
                 .read()
-                .unwrap()
                 .bank
                 .clone();
             debug!("RPC using optimistically confirmed slot: {:?}", bank.slot());
@@ -319,16 +320,17 @@ impl JsonRpcRequestProcessor {
         cluster_info: Arc<ClusterInfo>,
         genesis_hash: Hash,
         bigtable_ledger_storage: Option<solana_storage_bigtable::LedgerStorage>,
-        optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        optimistically_confirmed_bank: Arc<parking_lot::RwLock<OptimisticallyConfirmedBank>>,
         largest_accounts_cache: Arc<RwLock<LargestAccountsCache>>,
         max_slots: Arc<MaxSlots>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+        rpc_tx_sender: Sender<SanitizedTransaction>,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (sender, receiver) = unbounded();
-        let (latency_sender, latency_receiver) = bounded::<(Signature, Instant)>(0);
+        let (latency_sender, latency_receiver) = bounded::<Signature>(0);
         Builder::new()
             .name("measureTxLatency".to_string())
             .spawn({
@@ -336,22 +338,25 @@ impl JsonRpcRequestProcessor {
                 move || {
                     loop {
                         match latency_receiver.recv() {
-                            Ok((sig, recv_time)) => {
+                            Ok(sig) => {
+                                let recv_time = Instant::now();
                                 loop {
                                     let bank = match optimistically_confirmed_bank.try_read() {
-                                        Ok(b) => b.bank.clone(),
-                                        Err(_) => {
-                                            sleep(Duration::from_millis(1));
-                                            continue
-                                        }
+                                        Some(b) => b.bank.clone(),
+                                        None => continue,
                                     };
-                                    if let Some(_) = bank.get_signature_status_slot(&sig) {
+
+                                    let status_slot = bank.get_signature_status_slot(&sig);
+
+                                    if let Some(_) = status_slot {
                                         let latency = recv_time.elapsed().as_millis();
-                                        datapoint_info!("tx-latency", "txid" => sig.to_string(), ("latency", latency as i64, i64));
-                                        // println!("Tx {sig} is included in slot, latency {latency} ms");
+                                        datapoint_info!("tx-latency", ("latency", latency as i64, i64), ("txid", sig.to_string(), String));
                                         break;
                                     }
 
+                                    if recv_time.elapsed().as_millis() > 10000 {
+                                        break;
+                                    }
                                     sleep(Duration::from_millis(1));
                                 }
                             },
@@ -381,6 +386,7 @@ impl JsonRpcRequestProcessor {
                 max_complete_transaction_status_slot,
                 max_complete_rewards_slot,
                 prioritization_fee_cache,
+                rpc_tx_sender,
             },
             receiver,
         )
@@ -3718,7 +3724,7 @@ pub mod rpc_full {
             let (wire_transaction, unsanitized_tx) =
                 decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
 
-           if let Err(_) = meta.transaction_latency_sender.lock().unwrap().try_send((*unsanitized_tx.get_signature(), Instant::now())) {
+           if let Err(_) = meta.transaction_latency_sender.lock().unwrap().try_send(*unsanitized_tx.get_signature()) {
                // ignore error
            };
 
@@ -3810,6 +3816,11 @@ pub mod rpc_full {
                 }
             }
 
+            if let Err(_) = meta.rpc_tx_sender.try_send(transaction) {
+                // do nothing
+            }
+            Ok(signature.to_string())
+            /*
             _send_transaction(
                 meta,
                 signature,
@@ -3818,6 +3829,7 @@ pub mod rpc_full {
                 durable_nonce_info,
                 max_retries,
             )
+             */
         }
 
         fn simulate_transaction(

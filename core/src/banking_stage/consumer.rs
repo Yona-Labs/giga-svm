@@ -46,7 +46,7 @@ use {
 };
 
 /// Consumer will create chunks of transactions from buffer with up to this size.
-pub const TARGET_NUM_TRANSACTIONS_PER_BATCH: usize = 64;
+pub const TARGET_NUM_TRANSACTIONS_PER_BATCH: usize = 128;
 
 pub struct ProcessTransactionBatchOutput {
     // The number of transactions filtered out by the cost model
@@ -222,7 +222,7 @@ impl Consumer {
         Some(retryable_transaction_indexes)
     }
 
-    fn process_packets_transactions(
+    pub fn process_packets_transactions(
         &self,
         bank: &Arc<Bank>,
         bank_creation_time: &Instant,

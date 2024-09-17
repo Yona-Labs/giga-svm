@@ -31,7 +31,7 @@ impl BufferedPacketsDecision {
 #[derive(Clone)]
 pub struct DecisionMaker {
     my_pubkey: Pubkey,
-    poh_recorder: Arc<RwLock<PohRecorder>>,
+    pub poh_recorder: Arc<RwLock<PohRecorder>>,
 }
 
 impl DecisionMaker {
@@ -91,7 +91,7 @@ impl DecisionMaker {
         }
     }
 
-    fn bank_start(poh_recorder: &PohRecorder) -> Option<BankStart> {
+    pub fn bank_start(poh_recorder: &PohRecorder) -> Option<BankStart> {
         poh_recorder
             .bank_start()
             .filter(|bank_start| bank_start.should_working_bank_still_be_processing_txs())

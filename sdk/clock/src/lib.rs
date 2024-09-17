@@ -32,8 +32,8 @@ pub const DEFAULT_TICKS_PER_SECOND: u64 = 1000;
 #[cfg(test)]
 static_assertions::const_assert_eq!(MS_PER_TICK, 6);
 
-/// The number of milliseconds per tick (6).
-pub const MS_PER_TICK: u64 = 1000 / DEFAULT_TICKS_PER_SECOND;
+/// The number of microseconds per tick (6).
+pub const US_PER_TICK: u64 = 1000000 / DEFAULT_TICKS_PER_SECOND;
 
 // At 160 ticks/s, 64 ticks per slot implies that leader rotation and voting will happen
 // every 400 ms. A fast voting cadence ensures faster finality and convergence
