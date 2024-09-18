@@ -3817,13 +3817,15 @@ pub mod rpc_full {
                 }
             }
 
+            /*
             if let Err(_) = meta.rpc_tx_sender.try_send(transaction) {
                 // do nothing
             }
 
             Ok(signature.to_string())
 
-             /*
+             */
+
             _send_transaction(
                 meta,
                 signature,
@@ -3832,8 +3834,6 @@ pub mod rpc_full {
                 durable_nonce_info,
                 max_retries,
             )
-
-            */
         }
 
         fn simulate_transaction(
