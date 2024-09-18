@@ -2573,6 +2573,7 @@ fn _send_transaction(
     durable_nonce_info: Option<(Pubkey, Hash)>,
     max_retries: Option<usize>,
 ) -> Result<String> {
+    datapoint_info!("bank-process_transactions", ("tx_count", 1, i64));
     let transaction_info = TransactionInfo::new(
         signature,
         wire_transaction,
@@ -3819,8 +3820,10 @@ pub mod rpc_full {
             if let Err(_) = meta.rpc_tx_sender.try_send(transaction) {
                 // do nothing
             }
+
             Ok(signature.to_string())
-            /*
+
+             /*
             _send_transaction(
                 meta,
                 signature,
@@ -3829,7 +3832,8 @@ pub mod rpc_full {
                 durable_nonce_info,
                 max_retries,
             )
-             */
+
+            */
         }
 
         fn simulate_transaction(
