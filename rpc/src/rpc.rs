@@ -221,6 +221,7 @@ pub struct JsonRpcRequestProcessor {
     max_complete_rewards_slot: Arc<AtomicU64>,
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     rpc_tx_sender: Sender<SanitizedTransaction>,
+    transactions_received: Arc<AtomicU64>,
 }
 
 impl Metadata for JsonRpcRequestProcessor {}
@@ -387,6 +388,7 @@ impl JsonRpcRequestProcessor {
                 max_complete_rewards_slot,
                 prioritization_fee_cache,
                 rpc_tx_sender,
+                transactions_received: Arc::new(AtomicU64::new(0)),
             },
             receiver,
         )
@@ -2573,7 +2575,11 @@ fn _send_transaction(
     durable_nonce_info: Option<(Pubkey, Hash)>,
     max_retries: Option<usize>,
 ) -> Result<String> {
-    datapoint_info!("bank-process_transactions", ("tx_count", 1, i64));
+    let old_value = meta.transactions_received.fetch_add(1, Ordering::Relaxed);
+    if old_value > 127 {
+        datapoint_info!("bank-process_transactions", ("tx_count", old_value as i64 + 1, i64));
+        meta.transactions_received.store(0, Ordering::Relaxed);
+    }
     let transaction_info = TransactionInfo::new(
         signature,
         wire_transaction,
