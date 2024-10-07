@@ -692,7 +692,7 @@ impl BankingStage {
                 let banking_stage_stats = BankingStageStats::new(id);
                 let mut slot_metrics_tracker = LeaderSlotMetricsTracker::new(id);
 
-                let mut tx_buffer = Vec::with_capacity(128);
+                let mut tx_buffer = Vec::with_capacity(64);
 
                 loop {
                     let recv_start = Instant::now();
@@ -700,29 +700,35 @@ impl BankingStage {
                         match receiver.try_recv() {
                             Ok(tx) => {
                                 tx_buffer.push(tx);
-                                if tx_buffer.len() >= 128 || recv_start.elapsed().as_micros() >= 100 {
+                                if tx_buffer.len() >= 64 || recv_start.elapsed().as_micros() >= 200 {
                                     break;
                                 }
                             },
                             Err(TryRecvError::Disconnected) => break,
                             Err(TryRecvError::Empty) => {
-                                if !tx_buffer.is_empty() && recv_start.elapsed().as_micros() >= 100  {
+                                if !tx_buffer.is_empty() && recv_start.elapsed().as_micros() >= 200  {
                                     break;
                                 }
                             },
                         };
                     }
 
-                    let bank_start = loop {
+                    let (bank_start, bank_start_us) = measure_us!(loop {
                         if let Some(bank_start) = DecisionMaker::bank_start(&decision_maker.poh_recorder.read().unwrap()) {
                             break bank_start;
                         }
 
                         thread::sleep(Duration::from_nanos(10));
-                    };
-                    let before_process = Instant::now();
-                    consumer.process_packets_transactions(&bank_start.working_bank, &bank_start.bank_creation_time, &tx_buffer, &banking_stage_stats, &mut slot_metrics_tracker);
-                    datapoint_info!("process-packets-transactions", ("process_time", before_process.elapsed().as_micros() as i64, i64));
+                    });
+
+                    let (processing_result, process_time) = measure_us!(consumer.process_packets_transactions(&bank_start.working_bank, &bank_start.bank_creation_time, &tx_buffer, &banking_stage_stats, &mut slot_metrics_tracker));
+                    datapoint_info!(
+                        "process-packets-transactions",
+                        ("process_time", process_time as i64, i64),
+                        ("tx_count", tx_buffer.len() as i64, i64),
+                        ("committed_tx_count", processing_result.transaction_counts.committed_transactions_count as i64, i64),
+                        ("bank_start_us", bank_start_us as i64, i64)
+                    );
                     datapoint_info!("bank-process_transactions", ("tx_count", tx_buffer.len() as i64, i64));
                     tx_buffer.clear();
                 }
