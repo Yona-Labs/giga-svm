@@ -1,4 +1,7 @@
 //! The `rpc` module implements the Solana RPC interface.
+use std::thread::{sleep, Builder};
+use std::time::Instant;
+use crossbeam_channel::{bounded};
 use {
     crate::{
         max_slots::MaxSlots, optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
@@ -112,6 +115,8 @@ use {
         time::Duration,
     },
 };
+use solana_measure::measure::Measure;
+use solana_sdk::clock::DEFAULT_MS_PER_SLOT;
 
 pub mod account_resolver;
 
@@ -201,6 +206,7 @@ pub struct JsonRpcRequestProcessor {
     health: Arc<RpcHealth>,
     cluster_info: Arc<ClusterInfo>,
     genesis_hash: Hash,
+    transaction_latency_sender: Sender<Signature>,
     transaction_sender: Arc<Mutex<Sender<TransactionInfo>>>,
     bigtable_ledger_storage: Option<solana_storage_bigtable::LedgerStorage>,
     optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
@@ -210,6 +216,7 @@ pub struct JsonRpcRequestProcessor {
     max_complete_transaction_status_slot: Arc<AtomicU64>,
     max_complete_rewards_slot: Arc<AtomicU64>,
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+    rpc_tx_sender: Sender<SanitizedTransaction>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -317,8 +324,44 @@ impl JsonRpcRequestProcessor {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+        rpc_tx_sender: Sender<SanitizedTransaction>,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (sender, receiver) = unbounded();
+        let (transaction_latency_sender, latency_receiver) = bounded::<Signature>(0);
+        Builder::new()
+            .name("measureTxLatency".to_string())
+            .spawn({
+                let optimistically_confirmed_bank = optimistically_confirmed_bank.clone();
+                move || {
+                    loop {
+                        match latency_receiver.recv() {
+                            Ok(sig) => {
+                                let recv_time = Instant::now();
+                                loop {
+                                    let bank = match optimistically_confirmed_bank.try_read() {
+                                        Ok(b) => b.bank.clone(),
+                                        Err(_) => continue,
+                                    };
+
+                                    let status_slot = bank.get_signature_status_slot(&sig);
+
+                                    if let Some(_) = status_slot {
+                                        let latency = recv_time.elapsed().as_millis();
+                                        datapoint_info!("tx-latency", ("latency", latency as i64, i64), ("txid", sig.to_string(), String));
+                                        break;
+                                    }
+
+                                    if recv_time.elapsed().as_millis() > 10000 {
+                                        break;
+                                    }
+                                    sleep(Duration::from_millis(1));
+                                }
+                            },
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }).expect("measureTxLatency thread to be spawned");
         (
             Self {
                 config,
@@ -339,6 +382,8 @@ impl JsonRpcRequestProcessor {
                 max_complete_transaction_status_slot,
                 max_complete_rewards_slot,
                 prioritization_fee_cache,
+                rpc_tx_sender,
+                transaction_latency_sender,
             },
             receiver,
         )
@@ -350,6 +395,8 @@ impl JsonRpcRequestProcessor {
         socket_addr_space: SocketAddrSpace,
         connection_cache: Arc<ConnectionCache>,
     ) -> Self {
+        unimplemented!();
+        /*
         let genesis_hash = bank.hash();
         let bank_forks = BankForks::new_rw_arc(bank);
         let bank = bank_forks.read().unwrap().root_bank();
@@ -414,6 +461,8 @@ impl JsonRpcRequestProcessor {
             max_complete_rewards_slot: Arc::new(AtomicU64::default()),
             prioritization_fee_cache: Arc::new(PrioritizationFeeCache::default()),
         }
+
+         */
     }
 
     pub fn get_account_info(
@@ -3247,6 +3296,8 @@ pub mod rpc_full {
         solana_sdk::message::{SanitizedVersionedMessage, VersionedMessage},
         solana_transaction_status::UiInnerInstructions,
     };
+    use solana_client::rpc_client::SerializableTransaction;
+
     #[rpc]
     pub trait Full {
         type Metadata;
@@ -3602,6 +3653,9 @@ pub mod rpc_full {
             })?;
             let (wire_transaction, unsanitized_tx) =
                 decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
+            if let Err(_) = meta.transaction_latency_sender.try_send(*unsanitized_tx.get_signature()) {
+                // ignore error
+            };
 
             let preflight_commitment = if skip_preflight {
                 Some(CommitmentConfig::processed())
@@ -3685,6 +3739,13 @@ pub mod rpc_full {
                 }
             }
 
+            if let Err(_) = meta.rpc_tx_sender.try_send(transaction) {
+                // do nothing
+            }
+
+            Ok(signature.to_string())
+
+                /*
             _send_transaction(
                 meta,
                 signature,
@@ -3693,6 +3754,8 @@ pub mod rpc_full {
                 durable_nonce_info,
                 max_retries,
             )
+
+                 */
         }
 
         fn simulate_transaction(

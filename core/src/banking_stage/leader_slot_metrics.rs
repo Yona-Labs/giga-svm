@@ -19,7 +19,7 @@ use {
 /// will be dropped from the transactions queue and not counted in `Self::retryable_transaction_indexes`
 /// 3) Were executed and committed, captured by `committed_transactions_count` below.
 /// 4) Were executed and failed commit, captured by `failed_commit_count` below.
-pub(crate) struct ProcessTransactionsSummary {
+pub struct ProcessTransactionsSummary {
     // Returns true if we hit the end of the block/max PoH height for the block before
     // processing all the transactions in the batch.
     pub reached_max_poh_height: bool,

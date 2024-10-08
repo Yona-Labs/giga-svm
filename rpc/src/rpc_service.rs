@@ -1,5 +1,6 @@
 //! The `rpc_service` module implements the Solana JSON RPC service.
 
+use crossbeam_channel::Sender;
 use {
     crate::{
         cluster_tpu_info::ClusterTpuInfo,
@@ -53,6 +54,7 @@ use {
     },
     tokio_util::codec::{BytesCodec, FramedRead},
 };
+use solana_sdk::transaction::SanitizedTransaction;
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
 const INCREMENTAL_SNAPSHOT_REQUEST_PATH: &str = "/incremental-snapshot.tar.bz2";
@@ -360,6 +362,7 @@ impl JsonRpcService {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+        rpc_tx_sender: Sender<SanitizedTransaction>,
     ) -> Result<Self, String> {
         info!("rpc bound to {:?}", rpc_addr);
         info!("rpc configuration: {:?}", config);
@@ -476,6 +479,7 @@ impl JsonRpcService {
             max_complete_transaction_status_slot,
             max_complete_rewards_slot,
             prioritization_fee_cache,
+            rpc_tx_sender,
         );
 
         let leader_info =

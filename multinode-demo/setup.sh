@@ -49,10 +49,17 @@ if [[ -r spl-genesis-args.sh ]]; then
   args+=($SPL_GENESIS_ARGS)
 fi
 
+if [[ -r programs-genesis.sh ]]; then
+  PROGRAMS_GENESIS_ARGS=$(cat "$SOLANA_ROOT"/programs-genesis.sh)
+  #shellcheck disable=SC2207
+  #shellcheck disable=SC2206
+  args+=($PROGRAMS_GENESIS_ARGS)
+fi
+
 default_arg --ledger "$SOLANA_CONFIG_DIR"/bootstrap-validator
 default_arg --faucet-pubkey "$SOLANA_CONFIG_DIR"/faucet.json
 default_arg --faucet-lamports 500000000000000000
-default_arg --hashes-per-tick auto
+default_arg --hashes-per-tick sleep
 default_arg --cluster-type development
 
 $solana_genesis "${args[@]}"

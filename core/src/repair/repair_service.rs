@@ -33,7 +33,7 @@ use {
     solana_measure::measure::Measure,
     solana_runtime::bank_forks::BankForks,
     solana_sdk::{
-        clock::{Slot, DEFAULT_TICKS_PER_SECOND, MS_PER_TICK},
+        clock::{Slot, DEFAULT_TICKS_PER_SECOND, US_PER_TICK},
         epoch_schedule::EpochSchedule,
         hash::Hash,
         pubkey::Pubkey,
@@ -57,7 +57,7 @@ use {
 
 // Time to defer repair requests to allow for turbine propagation
 const DEFER_REPAIR_THRESHOLD: Duration = Duration::from_millis(200);
-const DEFER_REPAIR_THRESHOLD_TICKS: u64 = DEFER_REPAIR_THRESHOLD.as_millis() as u64 / MS_PER_TICK;
+const DEFER_REPAIR_THRESHOLD_TICKS: u64 = DEFER_REPAIR_THRESHOLD.as_micros() as u64 / US_PER_TICK;
 
 // When requesting repair for a specific shred through the admin RPC, we will
 // request up to NUM_PEERS_TO_SAMPLE_FOR_REPAIRS in the event a specific, valid

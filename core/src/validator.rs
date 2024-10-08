@@ -962,6 +962,9 @@ impl Validator {
 
         let rpc_override_health_check =
             Arc::new(AtomicBool::new(config.rpc_config.disable_health_check));
+
+        let (rpc_tx_sender, rpc_tx_receiver) = unbounded();
+
         let (
             json_rpc_service,
             pubsub_service,
@@ -1008,6 +1011,7 @@ impl Validator {
                 max_complete_transaction_status_slot,
                 max_complete_rewards_slot,
                 prioritization_fee_cache.clone(),
+                rpc_tx_sender,
             )?;
 
             (
@@ -1372,6 +1376,7 @@ impl Validator {
             &prioritization_fee_cache,
             config.block_production_method.clone(),
             config.generator_config.clone(),
+            rpc_tx_receiver,
         );
 
         datapoint_info!(

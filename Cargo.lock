@@ -6321,7 +6321,6 @@ dependencies = [
  "solana-clap-utils",
  "solana-cli-config",
  "solana-entry",
- "solana-inline-spl",
  "solana-ledger",
  "solana-logger",
  "solana-runtime",

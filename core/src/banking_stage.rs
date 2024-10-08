@@ -2,6 +2,7 @@
 //! to construct a software pipeline. The stage uses all available CPU cores and
 //! can do its processing in parallel with signature verification on the GPU.
 
+use crossbeam_channel::TryRecvError;
 use {
     self::{
         committer::Committer,
@@ -49,6 +50,7 @@ use {
         time::{Duration, Instant},
     },
 };
+use solana_sdk::transaction::SanitizedTransaction;
 
 // Below modules are pub to allow use by banking_stage bench
 pub mod committer;
@@ -80,7 +82,7 @@ pub const NUM_THREADS: u32 = 6;
 
 const TOTAL_BUFFERED_PACKETS: usize = 700_000;
 
-const NUM_VOTE_PROCESSING_THREADS: u32 = 2;
+const NUM_VOTE_PROCESSING_THREADS: u32 = 3;
 const MIN_THREADS_BANKING: u32 = 1;
 const MIN_TOTAL_THREADS: u32 = NUM_VOTE_PROCESSING_THREADS + MIN_THREADS_BANKING;
 
@@ -337,6 +339,7 @@ impl BankingStage {
         connection_cache: Arc<ConnectionCache>,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
+        receiver: Receiver<SanitizedTransaction>,
     ) -> Self {
         Self::new_num_threads(
             block_production_method,
@@ -352,6 +355,7 @@ impl BankingStage {
             connection_cache,
             bank_forks,
             prioritization_fee_cache,
+            receiver,
         )
     }
 
@@ -370,6 +374,7 @@ impl BankingStage {
         connection_cache: Arc<ConnectionCache>,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
+        receiver: Receiver<SanitizedTransaction>,
     ) -> Self {
         match block_production_method {
             BlockProductionMethod::ThreadLocalMultiIterator => {
@@ -386,6 +391,7 @@ impl BankingStage {
                     connection_cache,
                     bank_forks,
                     prioritization_fee_cache,
+                    receiver,
                 )
             }
             BlockProductionMethod::CentralScheduler => Self::new_central_scheduler(
@@ -401,6 +407,7 @@ impl BankingStage {
                 connection_cache,
                 bank_forks,
                 prioritization_fee_cache,
+                receiver,
             ),
         }
     }
@@ -419,6 +426,7 @@ impl BankingStage {
         connection_cache: Arc<ConnectionCache>,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
+        receiver: Receiver<SanitizedTransaction>,
     ) -> Self {
         assert!(num_threads >= MIN_TOTAL_THREADS);
         // Single thread to generate entries from many banks.
@@ -439,7 +447,7 @@ impl BankingStage {
         let transaction_recorder = poh_recorder.read().unwrap().new_recorder();
 
         // Many banks that process transactions in parallel.
-        let bank_thread_hdls: Vec<JoinHandle<()>> = (0..num_threads)
+        let mut bank_thread_hdls: Vec<JoinHandle<()>> = (0..num_threads)
             .map(|id| {
                 let (packet_receiver, unprocessed_transaction_storage) = match id {
                     0 => (
@@ -486,6 +494,9 @@ impl BankingStage {
                 )
             })
             .collect();
+
+        bank_thread_hdls.push(Self::spawn_process_rpc_transactions_thread(2, receiver, decision_maker.clone(), committer.clone(), transaction_recorder.clone(), log_messages_bytes_limit));
+
         Self { bank_thread_hdls }
     }
 
@@ -503,6 +514,7 @@ impl BankingStage {
         connection_cache: Arc<ConnectionCache>,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
+        receiver: Receiver<SanitizedTransaction>,
     ) -> Self {
         assert!(num_threads >= MIN_TOTAL_THREADS);
         // Single thread to generate entries from many banks.
@@ -549,6 +561,8 @@ impl BankingStage {
                 ),
             ));
         }
+
+        bank_thread_hdls.push(Self::spawn_process_rpc_transactions_thread(2, receiver, decision_maker.clone(), committer.clone(), transaction_recorder.clone(), log_messages_bytes_limit));
 
         // Create channels for communication between scheduler and workers
         let num_workers = (num_threads).saturating_sub(NUM_VOTE_PROCESSING_THREADS);
@@ -641,6 +655,64 @@ impl BankingStage {
                     id,
                     unprocessed_transaction_storage,
                 )
+            })
+            .unwrap()
+    }
+
+    fn spawn_process_rpc_transactions_thread(
+        id: u32,
+        receiver: Receiver<SanitizedTransaction>,
+        decision_maker: DecisionMaker,
+        committer: Committer,
+        transaction_recorder: TransactionRecorder,
+        log_messages_bytes_limit: Option<usize>,
+    ) -> JoinHandle<()> {
+        Builder::new()
+            .name("processRpcTransactions".into())
+            .spawn(move || {
+                let consumer = Consumer::new(
+                    committer,
+                    transaction_recorder,
+                    QosService::new(id),
+                    log_messages_bytes_limit,
+                );
+                let banking_stage_stats = BankingStageStats::new(id);
+                let mut slot_metrics_tracker = LeaderSlotMetricsTracker::new(id);
+
+                let mut tx_buffer = Vec::with_capacity(128);
+
+                loop {
+                    let recv_start = Instant::now();
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(tx) => {
+                                tx_buffer.push(tx);
+                                if tx_buffer.len() >= 128 || recv_start.elapsed().as_micros() >= 100 {
+                                    break;
+                                }
+                            },
+                            Err(TryRecvError::Disconnected) => break,
+                            Err(TryRecvError::Empty) => {
+                                if !tx_buffer.is_empty() && recv_start.elapsed().as_micros() >= 100  {
+                                    break;
+                                }
+                            },
+                        };
+                    }
+
+                    let bank_start = loop {
+                        if let Some(bank_start) = DecisionMaker::bank_start(&decision_maker.poh_recorder.read().unwrap()) {
+                            break bank_start;
+                        }
+
+                        thread::sleep(Duration::from_nanos(10));
+                    };
+                    let before_process = Instant::now();
+                    consumer.process_packets_transactions(&bank_start.working_bank, &bank_start.bank_creation_time, &tx_buffer, &banking_stage_stats, &mut slot_metrics_tracker);
+                    datapoint_info!("process-packets-transactions", ("process_time", before_process.elapsed().as_micros() as i64, i64));
+                    datapoint_info!("bank-process_transactions", ("tx_count", tx_buffer.len() as i64, i64));
+                    tx_buffer.clear();
+                }
             })
             .unwrap()
     }

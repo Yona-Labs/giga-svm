@@ -209,7 +209,7 @@ impl Consumer {
         Some(retryable_transaction_indexes)
     }
 
-    fn process_packets_transactions(
+    pub fn process_packets_transactions(
         &self,
         bank: &Arc<Bank>,
         bank_creation_time: &Instant,

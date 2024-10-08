@@ -4521,10 +4521,11 @@ impl Bank {
     }
 
     pub fn collect_balances(&self, batch: &TransactionBatch) -> TransactionBalances {
-        let mut balances: TransactionBalances = vec![];
+        let mut balances: TransactionBalances = Vec::with_capacity(batch.sanitized_transactions().len());
         for transaction in batch.sanitized_transactions() {
-            let mut transaction_balances: Vec<u64> = vec![];
-            for account_key in transaction.message().account_keys().iter() {
+            let account_keys = transaction.message().account_keys();
+            let mut transaction_balances: Vec<u64> = Vec::with_capacity(account_keys.len());
+            for account_key in account_keys.iter() {
                 transaction_balances.push(self.get_balance(account_key));
             }
             balances.push(transaction_balances);
