@@ -855,11 +855,8 @@ fn verify_slot_deltas_structural(
 ) -> std::result::Result<VerifySlotDeltasStructuralInfo, VerifySlotDeltasError> {
     // there should not be more entries than that status cache's max
     let num_entries = slot_deltas.len();
-    if num_entries > status_cache::MAX_CACHE_ENTRIES {
-        return Err(VerifySlotDeltasError::TooManyEntries(
-            num_entries,
-            status_cache::MAX_CACHE_ENTRIES,
-        ));
+    if num_entries > 4000 {
+        return Err(VerifySlotDeltasError::TooManyEntries(num_entries, 4000));
     }
 
     let mut slots_seen_so_far = HashSet::new();
