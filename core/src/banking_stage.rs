@@ -82,6 +82,9 @@ pub const NUM_THREADS: u32 = 6;
 
 const TOTAL_BUFFERED_PACKETS: usize = 700_000;
 
+// Fast copies are optional; reliable delivery is owned by SendTransactionService.
+pub const RPC_FAST_PATH_QUEUE_CAPACITY: usize = 1024;
+
 const NUM_VOTE_PROCESSING_THREADS: u32 = 3;
 const MIN_THREADS_BANKING: u32 = 1;
 const MIN_TOTAL_THREADS: u32 = NUM_VOTE_PROCESSING_THREADS + MIN_THREADS_BANKING;
@@ -681,7 +684,9 @@ impl BankingStage {
 
                 let mut tx_buffer = Vec::with_capacity(128);
 
-                loop {
+                // Block when idle and terminate when the RPC service disconnects.
+                while let Ok(transaction) = receiver.recv() {
+                    tx_buffer.push(transaction);
                     let recv_start = Instant::now();
                     loop {
                         match receiver.try_recv() {
@@ -700,17 +705,24 @@ impl BankingStage {
                         };
                     }
 
-                    let bank_start = loop {
-                        if let Some(bank_start) = DecisionMaker::bank_start(&decision_maker.poh_recorder.read().unwrap()) {
-                            break bank_start;
-                        }
-
-                        thread::sleep(Duration::from_nanos(10));
-                    };
-                    let before_process = Instant::now();
-                    consumer.process_packets_transactions(&bank_start.working_bank, &bank_start.bank_creation_time, &tx_buffer, &banking_stage_stats, &mut slot_metrics_tracker);
-                    datapoint_info!("process-packets-transactions", ("process_time", before_process.elapsed().as_micros() as i64, i64));
-                    datapoint_info!("bank-process_transactions", ("tx_count", tx_buffer.len() as i64, i64));
+                    let bank_start = DecisionMaker::bank_start(
+                        &decision_maker.poh_recorder.read().unwrap(),
+                    );
+                    if let Some(bank_start) = bank_start {
+                        let before_process = Instant::now();
+                        // This copy may race a slot boundary or encounter locked accounts.
+                        // The normal send service retains the transaction for retry.
+                        consumer.process_packets_transactions(
+                            &bank_start.working_bank,
+                            &bank_start.bank_creation_time,
+                            &tx_buffer,
+                            &banking_stage_stats,
+                            &mut slot_metrics_tracker,
+                        );
+                        datapoint_info!("process-packets-transactions", ("process_time", before_process.elapsed().as_micros() as i64, i64));
+                        datapoint_info!("bank-process_transactions", ("tx_count", tx_buffer.len() as i64, i64));
+                    }
+                    // Never wait for our own leadership; the regular copy is forwarded.
                     tx_buffer.clear();
                 }
             })

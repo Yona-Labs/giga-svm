@@ -2537,7 +2537,10 @@ fn _send_transaction(
         .lock()
         .unwrap()
         .send(transaction_info)
-        .unwrap_or_else(|err| warn!("Failed to enqueue transaction: {}", err));
+        .map_err(|err| {
+            warn!("Failed to enqueue transaction: {}", err);
+            Error::internal_error()
+        })?;
 
     Ok(signature.to_string())
 }
@@ -3296,7 +3299,6 @@ pub mod rpc_full {
         solana_sdk::message::{SanitizedVersionedMessage, VersionedMessage},
         solana_transaction_status::UiInnerInstructions,
     };
-    use solana_client::rpc_client::SerializableTransaction;
 
     #[rpc]
     pub trait Full {
@@ -3653,9 +3655,9 @@ pub mod rpc_full {
             })?;
             let (wire_transaction, unsanitized_tx) =
                 decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
-            if let Err(_) = meta.transaction_latency_sender.try_send(*unsanitized_tx.get_signature()) {
-                // ignore error
-            };
+            if let Some(signature) = unsanitized_tx.signatures.first() {
+                let _ = meta.transaction_latency_sender.try_send(*signature);
+            }
 
             let preflight_commitment = if skip_preflight {
                 Some(CommitmentConfig::processed())
@@ -3686,9 +3688,11 @@ pub mod rpc_full {
                     preflight_bank.block_height() + MAX_RECENT_BLOCKHASHES as u64;
             }
 
-            if !skip_preflight {
-                verify_transaction(&transaction, &preflight_bank.feature_set)?;
+            // The direct BankingStage path bypasses TPU SigVerify. Preflight may
+            // skip simulation, but must never skip authorization on this path.
+            verify_transaction(&transaction, &preflight_bank.feature_set)?;
 
+            if !skip_preflight {
                 match meta.health.check() {
                     RpcHealthStatus::Ok => (),
                     RpcHealthStatus::Unknown => {
@@ -3739,23 +3743,20 @@ pub mod rpc_full {
                 }
             }
 
-            if let Err(_) = meta.rpc_tx_sender.try_send(transaction) {
-                // do nothing
-            }
-
-            Ok(signature.to_string())
-
-                /*
-            _send_transaction(
-                meta,
+            // Keep forwarding and retries independent of the local leader window,
+            // a full fast-path queue, and retryable direct-execution failures.
+            let signature = _send_transaction(
+                meta.clone(),
                 signature,
                 wire_transaction,
                 last_valid_block_height,
                 durable_nonce_info,
                 max_retries,
-            )
+            )?;
 
-                 */
+            // Best-effort acceleration only: the regular send service owns delivery.
+            let _ = meta.rpc_tx_sender.try_send(transaction);
+            Ok(signature)
         }
 
         fn simulate_transaction(

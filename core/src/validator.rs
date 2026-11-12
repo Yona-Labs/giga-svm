@@ -963,7 +963,8 @@ impl Validator {
         let rpc_override_health_check =
             Arc::new(AtomicBool::new(config.rpc_config.disable_health_check));
 
-        let (rpc_tx_sender, rpc_tx_receiver) = unbounded();
+        let (rpc_tx_sender, rpc_tx_receiver) =
+            bounded(crate::banking_stage::RPC_FAST_PATH_QUEUE_CAPACITY);
 
         let (
             json_rpc_service,
