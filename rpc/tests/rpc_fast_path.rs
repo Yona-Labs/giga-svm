@@ -15,7 +15,10 @@ use {
         rpc::{create_validator_exit, JsonRpcConfig},
         rpc_service::JsonRpcService,
     },
-    solana_rpc_client_api::request::RpcRequest,
+    solana_rpc_client_api::{
+        client_error::ErrorKind,
+        request::{RpcError, RpcRequest},
+    },
     solana_runtime::{
         bank::Bank,
         bank_forks::BankForks,
@@ -23,7 +26,7 @@ use {
         prioritization_fee_cache::PrioritizationFeeCache,
     },
     solana_sdk::{
-        message::{v0, VersionedMessage},
+        message::{v0, Message, VersionedMessage},
         pubkey::Pubkey,
         signature::{Keypair, Signature, Signer},
         system_instruction, system_transaction,
@@ -182,6 +185,115 @@ fn assert_forwarded(socket: &UdpSocket, tx: &VersionedTransaction) {
             "expected transaction was not forwarded"
         );
     }
+}
+
+#[test]
+fn test_rpc_missing_signatures_returns_error_and_keeps_process_alive() {
+    const CHILD_ENV: &str = "GIGA_SVM_ZERO_SIGNATURE_CHILD";
+    const CHILD_COMPLETED: &str = "GIGA_SVM_ZERO_SIGNATURE_CASES_COMPLETED";
+    if std::env::var(CHILD_ENV).as_deref() != Ok("1") {
+        // A production panic hook exits the entire process, including when an
+        // HTTP worker panics. Isolate it so the parent can report a regression.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "test_rpc_missing_signatures_returns_error_and_keeps_process_alive",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated RPC process did not survive: {}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETED),
+            "child did not complete the RPC regression cases"
+        );
+        return;
+    }
+
+    solana_metrics::set_panic_hook("validator", None);
+    with_rpc(|client, bank, mint, fast, tpu| {
+        let payer = Pubkey::new_unique();
+        let instructions = [system_instruction::transfer(
+            &payer,
+            &Pubkey::new_unique(),
+            1,
+        )];
+        let messages = [
+            VersionedMessage::Legacy(Message::new_with_blockhash(
+                &instructions,
+                Some(&payer),
+                &bank.last_blockhash(),
+            )),
+            VersionedMessage::V0(
+                v0::Message::try_compile(&payer, &instructions, &[], bank.last_blockhash())
+                    .unwrap(),
+            ),
+        ];
+        for message in messages {
+            // No signing key or funded payer is needed to construct this input.
+            let transaction = VersionedTransaction {
+                signatures: vec![],
+                message,
+            };
+            let wire = bincode::serialize(&transaction).unwrap();
+            for skip_preflight in [None, Some(false), Some(true)] {
+                let params = match skip_preflight {
+                    // No config object: exercise all sendTransaction defaults.
+                    None => json!([bs58::encode(&wire).into_string()]),
+                    Some(skip) => json!([
+                        STANDARD.encode(&wire),
+                        {"encoding": "base64", "skipPreflight": skip, "preflightCommitment": "processed"}
+                    ]),
+                };
+                let error = client
+                    .send::<String>(RpcRequest::SendTransaction, params)
+                    .expect_err("missing signatures must return an RPC error");
+                assert!(
+                    matches!(
+                        error.kind(),
+                        ErrorKind::RpcError(RpcError::RpcResponseError { code: -32602, .. })
+                    ),
+                    "expected invalid params for missing signatures, got: {error}"
+                );
+                assert!(error.to_string().contains("invalid transaction"), "{error}");
+                assert!(fast.try_recv().is_err());
+                assert_eq!(
+                    client
+                        .get_slot_with_commitment(
+                            solana_sdk::commitment_config::CommitmentConfig::processed()
+                        )
+                        .unwrap(),
+                    bank.slot()
+                );
+            }
+        }
+        tpu.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        assert!(tpu.recv(&mut [0; 1232]).is_err());
+
+        // The same HTTP service must still accept and deliver valid traffic.
+        let valid = transfer(bank, mint);
+        assert_eq!(
+            submit(client, &valid, true).unwrap(),
+            valid.signatures[0].to_string()
+        );
+        assert_eq!(
+            fast.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .to_versioned_transaction(),
+            valid
+        );
+        assert_forwarded(tpu, &valid);
+    });
+    println!("{CHILD_COMPLETED}");
 }
 
 #[test]
