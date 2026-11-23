@@ -480,6 +480,7 @@ impl JsonRpcService {
             max_complete_rewards_slot,
             prioritization_fee_cache,
             rpc_tx_sender,
+            &send_transaction_service_config,
         );
 
         let leader_info =

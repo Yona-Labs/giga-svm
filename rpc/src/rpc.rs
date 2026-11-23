@@ -82,7 +82,10 @@ use {
         },
     },
     solana_send_transaction_service::{
-        send_transaction_service::{SendTransactionService, TransactionInfo},
+        send_transaction_service::{
+            Config as SendTransactionConfig, SendTransactionService, TransactionInfo,
+            TransactionSender,
+        },
         tpu_info::NullTpuInfo,
     },
     solana_stake_program,
@@ -205,7 +208,7 @@ pub struct JsonRpcRequestProcessor {
     cluster_info: Arc<ClusterInfo>,
     genesis_hash: Hash,
     transaction_latency_sender: Sender<Signature>,
-    transaction_sender: Sender<TransactionInfo>,
+    transaction_sender: TransactionSender,
     bigtable_ledger_storage: Option<solana_storage_bigtable::LedgerStorage>,
     optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
     largest_accounts_cache: Arc<RwLock<LargestAccountsCache>>,
@@ -323,8 +326,10 @@ impl JsonRpcRequestProcessor {
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         rpc_tx_sender: Sender<SanitizedTransaction>,
-    ) -> (Self, Receiver<TransactionInfo>) {
-        let (sender, receiver) = bounded(SEND_TRANSACTION_QUEUE_CAPACITY);
+        send_config: &SendTransactionConfig,
+    ) -> (Self, Arc<Receiver<TransactionInfo>>) {
+        let (sender, receiver) =
+            TransactionSender::channel(SEND_TRANSACTION_QUEUE_CAPACITY, send_config);
         let (transaction_latency_sender, latency_receiver) = bounded::<Signature>(0);
         Builder::new()
             .name("measureTxLatency".to_string())
@@ -413,7 +418,10 @@ impl JsonRpcRequestProcessor {
             .my_contact_info()
             .tpu(connection_cache.protocol())
             .unwrap();
-        let (sender, receiver) = bounded(SEND_TRANSACTION_QUEUE_CAPACITY);
+        let (sender, receiver) = TransactionSender::channel(
+            SEND_TRANSACTION_QUEUE_CAPACITY,
+            &SendTransactionConfig::default(),
+        );
         SendTransactionService::new::<NullTpuInfo>(
             tpu_address,
             &bank_forks,
@@ -2535,7 +2543,7 @@ fn _send_transaction(
         None,
     );
     meta.transaction_sender
-        .try_send(transaction_info)
+        .try_submit(transaction_info)
         .map_err(|err| match err {
             TrySendError::Full(_) => RpcCustomError::SendTransactionQueueFull.into(),
             TrySendError::Disconnected(_) => {
@@ -4917,6 +4925,7 @@ pub mod tests {
                 max_complete_rewards_slot,
                 Arc::new(PrioritizationFeeCache::default()),
                 unbounded().0,
+                &SendTransactionConfig::default(),
             )
             .0;
 
@@ -6870,11 +6879,8 @@ pub mod tests {
     #[test]
     fn test_rpc_send_transaction_rejects_full_forwarding_queue() {
         let mut handler = RpcHandler::start();
-        assert_eq!(
-            handler.meta.transaction_sender.capacity(),
-            Some(SEND_TRANSACTION_QUEUE_CAPACITY)
-        );
-        let (forward_sender, forward_receiver) = bounded(1);
+        let (forward_sender, forward_receiver) =
+            TransactionSender::channel(1, &SendTransactionConfig::default());
         let (direct_sender, direct_receiver) = bounded(1);
         handler.meta.transaction_sender = forward_sender;
         handler.meta.rpc_tx_sender = direct_sender;
@@ -6899,8 +6905,21 @@ pub mod tests {
             signature.to_string()
         );
         assert_eq!(direct_receiver.try_recv().unwrap().signature(), &signature);
+        let other_tx = system_transaction::transfer(
+            &handler.mint_keypair,
+            &Pubkey::new_unique(),
+            1,
+            handler.working_bank().last_blockhash(),
+        );
+        let other_request = create_test_request(
+            "sendTransaction",
+            Some(json!([
+                BASE64_STANDARD.encode(serialize(&other_tx).unwrap()),
+                { "encoding": "base64", "skipPreflight": true }
+            ])),
+        );
         assert_eq!(
-            parse_failure_response(handler.handle_request_sync(request.clone())),
+            parse_failure_response(handler.handle_request_sync(other_request.clone())),
             (
                 JSON_RPC_SERVER_ERROR_SEND_TRANSACTION_QUEUE_FULL,
                 "Transaction submission queue is full. Try again later.".to_string()
@@ -6910,10 +6929,50 @@ pub mod tests {
         assert_eq!(forward_receiver.try_recv().unwrap().signature, signature);
 
         assert_eq!(
+            parse_success_result::<String>(handler.handle_request_sync(other_request)),
+            other_tx.signatures[0].to_string()
+        );
+        assert_eq!(
+            forward_receiver.try_recv().unwrap().signature,
+            other_tx.signatures[0]
+        );
+        assert_eq!(
+            direct_receiver.try_recv().unwrap().signature(),
+            &other_tx.signatures[0]
+        );
+
+        // The intake channel is empty, but all slots may belong to transactions
+        // already drained by the forwarding worker.
+        let mut in_flight = Vec::new();
+        for _ in
+            0..solana_send_transaction_service::send_transaction_service::MAX_TRANSACTION_QUEUE_SIZE
+        {
+            handler
+                .meta
+                .transaction_sender
+                .try_submit(TransactionInfo::new(
+                    Signature::new_unique(),
+                    vec![],
+                    0,
+                    None,
+                    None,
+                    None,
+                ))
+                .unwrap();
+            in_flight.push(forward_receiver.try_recv().unwrap());
+        }
+        assert!(forward_receiver.is_empty());
+        assert_eq!(
+            parse_failure_response(handler.handle_request_sync(request.clone())).0,
+            JSON_RPC_SERVER_ERROR_SEND_TRANSACTION_QUEUE_FULL
+        );
+        assert!(direct_receiver.is_empty());
+        assert!(forward_receiver.is_empty());
+        in_flight.pop();
+        assert_eq!(
             parse_success_result::<String>(handler.handle_request_sync(request)),
             signature.to_string()
         );
-        assert_eq!(forward_receiver.try_recv().unwrap().signature, signature);
         assert_eq!(direct_receiver.try_recv().unwrap().signature(), &signature);
     }
 
@@ -6968,6 +7027,7 @@ pub mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
             unbounded().0,
+            &SendTransactionConfig::default(),
         );
         SendTransactionService::new::<NullTpuInfo>(
             tpu_address,
@@ -7242,6 +7302,7 @@ pub mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
             unbounded().0,
+            &SendTransactionConfig::default(),
         );
         SendTransactionService::new::<NullTpuInfo>(
             tpu_address,
@@ -8875,6 +8936,7 @@ pub mod tests {
             max_complete_rewards_slot,
             Arc::new(PrioritizationFeeCache::default()),
             unbounded().0,
+            &SendTransactionConfig::default(),
         );
 
         let mut io = MetaIoHandler::default();

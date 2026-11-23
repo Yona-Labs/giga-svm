@@ -14,6 +14,7 @@ use {
         leader_slot_metrics::LeaderSlotMetricsTracker,
         packet_receiver::PacketReceiver,
         qos_service::QosService,
+        read_write_account_set::ReadWriteAccountSet,
         unprocessed_packet_batches::*,
         unprocessed_transaction_storage::{ThreadType, UnprocessedTransactionStorage},
     },
@@ -697,6 +698,7 @@ impl BankingStage {
                 let mut slot_metrics_tracker = LeaderSlotMetricsTracker::new(id);
 
                 let mut tx_buffer = Vec::with_capacity(128);
+                let mut account_locks = ReadWriteAccountSet::default();
 
                 // Block when idle and terminate when the RPC service disconnects.
                 while let Ok(transaction) = receiver.recv() {
@@ -729,15 +731,32 @@ impl BankingStage {
                         }
                         if !tx_buffer.is_empty() {
                             let before_process = Instant::now();
-                            // This copy may race a slot boundary or encounter locked accounts.
-                            // The normal send service retains the transaction for retry.
-                            consumer.process_packets_transactions(
-                                &bank_start.working_bank,
-                                &bank_start.bank_creation_time,
-                                &tx_buffer,
-                                &banking_stage_stats,
-                                &mut slot_metrics_tracker,
-                            );
+                            // Execute consecutive non-conflicting batches in submission order.
+                            // The reserved forwarding copy covers external locks and slot changes.
+                            let mut remaining = tx_buffer.as_slice();
+                            while !remaining.is_empty() {
+                                account_locks.clear();
+                                let batch_len = remaining
+                                    .iter()
+                                    .position(|tx| !account_locks.take_locks(tx.message()))
+                                    .unwrap_or(remaining.len())
+                                    // Let the bank reject a transaction with internally conflicting keys.
+                                    .max(1);
+                                let (batch, rest) = remaining.split_at(batch_len);
+                                let summary = consumer.process_packets_transactions(
+                                    &bank_start.working_bank,
+                                    &bank_start.bank_creation_time,
+                                    batch,
+                                    &banking_stage_stats,
+                                    &mut slot_metrics_tracker,
+                                );
+                                if summary.reached_max_poh_height
+                                    || !bank_start.should_working_bank_still_be_processing_txs()
+                                {
+                                    break;
+                                }
+                                remaining = rest;
+                            }
                             datapoint_info!(
                                 "process-packets-transactions",
                                 (

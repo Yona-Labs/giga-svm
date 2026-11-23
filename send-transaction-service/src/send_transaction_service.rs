@@ -1,6 +1,6 @@
 use {
     crate::tpu_info::TpuInfo,
-    crossbeam_channel::{Receiver, RecvTimeoutError},
+    crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError},
     log::*,
     solana_client::{
         connection_cache::{ConnectionCache, Protocol},
@@ -10,8 +10,8 @@ use {
     solana_metrics::datapoint_warn,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_sdk::{
-        clock::Slot, hash::Hash, nonce_account, pubkey::Pubkey, saturating_add_assign,
-        signature::Signature, timing::AtomicInterval, transport::TransportError,
+        clock::Slot, hash::Hash, nonce_account, pubkey::Pubkey, signature::Signature,
+        timing::AtomicInterval, transport::TransportError,
     },
     std::{
         collections::{
@@ -21,15 +21,15 @@ use {
         net::SocketAddr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, Mutex, RwLock,
+            Arc, Mutex, RwLock, Weak,
         },
         thread::{self, sleep, Builder, JoinHandle},
         time::{Duration, Instant},
     },
 };
 
-/// Maximum size of the transaction queue
-const MAX_TRANSACTION_QUEUE_SIZE: usize = 10_000; // This seems like a lot but maybe it needs to be bigger one day
+/// Maximum number of distinct transactions retained for retry, including RPC admissions in transit.
+pub const MAX_TRANSACTION_QUEUE_SIZE: usize = 10_000;
 
 /// Default retry interval
 const DEFAULT_RETRY_RATE_MS: u64 = 2_000;
@@ -62,12 +62,83 @@ pub struct SendTransactionService {
     exit: Arc<AtomicBool>,
 }
 
+/// Admission to the RPC forwarding queue and its retry pool is one operation.
+#[derive(Clone)]
+pub struct TransactionSender {
+    sender: Sender<TransactionInfo>,
+    pending: Arc<Mutex<HashSet<Signature>>>,
+    receiver: Weak<Receiver<TransactionInfo>>,
+    config: Arc<Config>,
+}
+
+impl TransactionSender {
+    pub fn channel(capacity: usize, config: &Config) -> (Self, Arc<Receiver<TransactionInfo>>) {
+        let (sender, receiver) = bounded(capacity);
+        let receiver = Arc::new(receiver);
+        (
+            Self {
+                sender,
+                pending: Arc::default(),
+                receiver: Arc::downgrade(&receiver),
+                config: Arc::new(config.clone()),
+            },
+            receiver,
+        )
+    }
+
+    pub fn try_submit(&self, mut tx: TransactionInfo) -> Result<(), TrySendError<()>> {
+        let signature = tx.signature;
+        let mut pending = self.pending.lock().unwrap();
+        // A disconnected bounded channel can still own buffered transactions.
+        // Their reservations must not make duplicate requests appear successful.
+        if self.receiver.strong_count() == 0 {
+            return Err(TrySendError::Disconnected(()));
+        }
+        if pending.contains(&signature) {
+            return Ok(());
+        }
+        let reserve = self.config.max_retries(&tx) != Some(0);
+        if reserve {
+            if pending.len() >= MAX_TRANSACTION_QUEUE_SIZE {
+                return Err(TrySendError::Full(()));
+            }
+            tx.retry_reservation = Some(RetryReservation {
+                signature,
+                pool: Arc::downgrade(&self.pending),
+            });
+        }
+        // Keep the lock across try_send: another caller must never see a
+        // duplicate as accepted if the original enqueue fails.
+        match self.sender.try_send(tx) {
+            Ok(()) => {
+                if reserve {
+                    pending.insert(signature);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let full = error.is_full();
+                // Nothing was registered. Disarm Drop while holding the lock.
+                if let Some(reservation) = &mut error.into_inner().retry_reservation {
+                    reservation.pool = Weak::new();
+                }
+                Err(if full {
+                    TrySendError::Full(())
+                } else {
+                    TrySendError::Disconnected(())
+                })
+            }
+        }
+    }
+}
+
 pub struct TransactionInfo {
     pub signature: Signature,
     pub wire_transaction: Vec<u8>,
     pub last_valid_block_height: u64,
     pub durable_nonce_info: Option<(Pubkey, Hash)>,
     pub max_retries: Option<usize>,
+    retry_reservation: Option<RetryReservation>,
     retries: usize,
     /// Last time the transaction was sent
     last_sent_time: Option<Instant>,
@@ -88,8 +159,23 @@ impl TransactionInfo {
             last_valid_block_height,
             durable_nonce_info,
             max_retries,
+            retry_reservation: None,
             retries: 0,
             last_sent_time,
+        }
+    }
+}
+
+// Moves with the transaction from the channel through the batch to the retry map.
+struct RetryReservation {
+    signature: Signature,
+    pool: Weak<Mutex<HashSet<Signature>>>,
+}
+
+impl Drop for RetryReservation {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.lock().unwrap().remove(&self.signature);
         }
     }
 }
@@ -115,6 +201,14 @@ pub struct Config {
     /// How frequently batches are sent
     pub batch_send_rate_ms: u64,
     pub tpu_peers: Option<Vec<SocketAddr>>,
+}
+
+impl Config {
+    fn max_retries(&self, tx: &TransactionInfo) -> Option<usize> {
+        tx.max_retries
+            .or(self.default_max_retries)
+            .map(|limit| limit.min(self.service_max_retries))
+    }
 }
 
 impl Default for Config {
@@ -333,7 +427,7 @@ impl SendTransactionService {
         tpu_address: SocketAddr,
         bank_forks: &Arc<RwLock<BankForks>>,
         leader_info: Option<T>,
-        receiver: Receiver<TransactionInfo>,
+        receiver: impl Into<Arc<Receiver<TransactionInfo>>>,
         connection_cache: &Arc<ConnectionCache>,
         retry_rate_ms: u64,
         leader_forward_count: u64,
@@ -359,7 +453,7 @@ impl SendTransactionService {
         tpu_address: SocketAddr,
         bank_forks: &Arc<RwLock<BankForks>>,
         leader_info: Option<T>,
-        receiver: Receiver<TransactionInfo>,
+        receiver: impl Into<Arc<Receiver<TransactionInfo>>>,
         connection_cache: &Arc<ConnectionCache>,
         config: Config,
         exit: Arc<AtomicBool>,
@@ -372,7 +466,7 @@ impl SendTransactionService {
 
         let receive_txn_thread = Self::receive_txn_thread(
             tpu_address,
-            receiver,
+            receiver.into(),
             leader_info_provider.clone(),
             connection_cache.clone(),
             config.clone(),
@@ -401,7 +495,7 @@ impl SendTransactionService {
     /// Thread responsible for receiving transactions from RPC clients.
     fn receive_txn_thread<T: TpuInfo + std::marker::Send + 'static>(
         tpu_address: SocketAddr,
-        receiver: Receiver<TransactionInfo>,
+        receiver: Arc<Receiver<TransactionInfo>>,
         leader_info_provider: Arc<Mutex<CurrentLeaderInfo<T>>>,
         connection_cache: Arc<ConnectionCache>,
         config: Config,
@@ -434,18 +528,21 @@ impl SendTransactionService {
                     Err(RecvTimeoutError::Timeout) => {}
                     Ok(transaction_info) => {
                         stats.received_transactions.fetch_add(1, Ordering::Relaxed);
-                        let entry = transactions.entry(transaction_info.signature);
-                        let mut new_transaction = false;
-                        if let Entry::Vacant(_) = entry {
-                            if !retry_transactions
-                                .lock()
-                                .unwrap()
-                                .contains_key(&transaction_info.signature)
-                            {
-                                entry.or_insert(transaction_info);
-                                new_transaction = true;
+                        let signature = transaction_info.signature;
+                        let new_transaction = if transaction_info.retry_reservation.is_some() {
+                            // Admission deduplicates across the channel, batch, and retry map.
+                            // Supersede any pending one-shot copy so its retry is retained.
+                            transactions.insert(signature, transaction_info).is_none()
+                        } else if let Entry::Vacant(entry) = transactions.entry(signature) {
+                            if retry_transactions.lock().unwrap().contains_key(&signature) {
+                                false
+                            } else {
+                                entry.insert(transaction_info);
+                                true
                             }
-                        }
+                        } else {
+                            false
+                        };
                         if !new_transaction {
                             stats
                                 .received_duplicate_transactions
@@ -473,27 +570,22 @@ impl SendTransactionService {
                     {
                         // take a lock of retry_transactions and move the batch to the retry set.
                         let mut retry_transactions = retry_transactions.lock().unwrap();
-                        let transactions_to_retry = transactions.len();
-                        let mut transactions_added_to_retry: usize = 0;
                         for (signature, mut transaction_info) in transactions.drain() {
-                            let retry_len = retry_transactions.len();
-                            let entry = retry_transactions.entry(signature);
-                            if let Entry::Vacant(_) = entry {
-                                if retry_len >= MAX_TRANSACTION_QUEUE_SIZE {
-                                    datapoint_warn!("send_transaction_service-queue-overflow");
-                                    break;
-                                } else {
-                                    transaction_info.last_sent_time = Some(last_sent_time);
-                                    saturating_add_assign!(transactions_added_to_retry, 1);
-                                    entry.or_insert(transaction_info);
-                                }
+                            if config.max_retries(&transaction_info) == Some(0) {
+                                continue;
                             }
+                            // The banks-server channel has no RPC reservations.
+                            // RPC transactions already own their retry slot.
+                            if transaction_info.retry_reservation.is_none()
+                                && retry_transactions.len() >= MAX_TRANSACTION_QUEUE_SIZE
+                            {
+                                stats.retry_queue_overflow.fetch_add(1, Ordering::Relaxed);
+                                datapoint_warn!("send_transaction_service-queue-overflow");
+                                continue;
+                            }
+                            transaction_info.last_sent_time = Some(last_sent_time);
+                            retry_transactions.insert(signature, transaction_info);
                         }
-                        stats.retry_queue_overflow.fetch_add(
-                            transactions_to_retry.saturating_sub(transactions_added_to_retry)
-                                as u64,
-                            Ordering::Relaxed,
-                        );
                         stats
                             .retry_queue_size
                             .store(retry_transactions.len() as u64, Ordering::Relaxed);
@@ -646,12 +738,7 @@ impl SendTransactionService {
                 return false;
             }
 
-            let max_retries = transaction_info
-                .max_retries
-                .or(config.default_max_retries)
-                .map(|max_retries| max_retries.min(config.service_max_retries));
-
-            if let Some(max_retries) = max_retries {
+            if let Some(max_retries) = config.max_retries(transaction_info) {
                 if transaction_info.retries >= max_retries {
                     info!("Dropping transaction due to max retries: {}", signature);
                     result.max_retries_elapsed += 1;
@@ -837,6 +924,71 @@ mod test {
     };
 
     #[test]
+    fn reserve_retry_until_the_admitted_transaction_is_dropped() {
+        let info =
+            |signature, retries| TransactionInfo::new(signature, vec![], 0, None, retries, None);
+        let (sender, receiver) = TransactionSender::channel(1, &Config::default());
+        let mut admitted = Vec::new();
+        for _ in 1..MAX_TRANSACTION_QUEUE_SIZE {
+            sender
+                .try_submit(info(Signature::new_unique(), None))
+                .unwrap();
+            admitted.push(receiver.recv().unwrap());
+        }
+        let last = Signature::new_unique();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    sender.try_submit(info(last, None)).unwrap();
+                });
+            }
+        });
+        let last_tx = receiver.try_recv().unwrap();
+        assert_eq!(last_tx.signature, last);
+        assert!(receiver.is_empty());
+        let next = Signature::new_unique();
+        assert_eq!(
+            sender.try_submit(info(next, None)),
+            Err(TrySendError::Full(()))
+        );
+        sender.try_submit(info(next, Some(0))).unwrap();
+        assert!(receiver.recv().unwrap().retry_reservation.is_none());
+        drop(last_tx);
+        sender.try_submit(info(next, None)).unwrap();
+        assert_eq!(receiver.recv().unwrap().signature, next);
+        drop(admitted);
+        assert!(sender.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_enqueue_releases_admission_and_default_zero_does_not_reserve() {
+        let config = Config {
+            default_max_retries: Some(0),
+            ..Config::default()
+        };
+        let (sender, receiver) = TransactionSender::channel(1, &config);
+        let signature = Signature::new_unique();
+        let info = |retries| TransactionInfo::new(signature, vec![], 0, None, retries, None);
+        sender.try_submit(info(None)).unwrap();
+        assert_eq!(
+            sender.try_submit(info(Some(1))),
+            Err(TrySendError::Full(()))
+        );
+        assert!(receiver.recv().unwrap().retry_reservation.is_none());
+        sender.try_submit(info(Some(1))).unwrap();
+        drop(receiver);
+        assert_eq!(
+            sender.try_submit(info(Some(1))),
+            Err(TrySendError::Disconnected(()))
+        );
+        let pending = sender.pending.clone();
+        drop(sender);
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn service_exit() {
         let tpu_address = "127.0.0.1:0".parse().unwrap();
         let bank = Bank::default_for_tests();
@@ -872,6 +1024,7 @@ mod test {
             last_valid_block_height: 0,
             durable_nonce_info: None,
             max_retries: None,
+            retry_reservation: None,
             retries: 0,
             last_sent_time: None,
         };
@@ -957,17 +1110,20 @@ mod test {
         info!("Expired transactions are dropped...");
         let leader_info_provider = Arc::new(Mutex::new(CurrentLeaderInfo::new(None)));
         let stats = SendTransactionServiceStats::default();
-        transactions.insert(
-            Signature::default(),
-            TransactionInfo::new(
+        let (sender, receiver) = TransactionSender::channel(1, &config);
+        sender
+            .try_submit(TransactionInfo::new(
                 Signature::default(),
                 vec![],
                 root_bank.block_height() - 1,
                 None,
                 None,
                 Some(Instant::now()),
-            ),
-        );
+            ))
+            .unwrap();
+        let expired = receiver.recv().unwrap();
+        transactions.insert(expired.signature, expired);
+        assert_eq!(sender.pending.lock().unwrap().len(), 1);
         let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
         let result = SendTransactionService::process_transactions::<NullTpuInfo>(
             &working_bank,
@@ -979,6 +1135,7 @@ mod test {
             &config,
             &stats,
         );
+        assert!(sender.pending.lock().unwrap().is_empty());
         assert!(transactions.is_empty());
         assert_eq!(
             result,

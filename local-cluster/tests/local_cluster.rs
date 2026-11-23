@@ -102,6 +102,95 @@ use {
 };
 
 #[test]
+#[serial]
+fn test_rpc_retries_conflicting_transfers_across_slots() {
+    let mut config =
+        ClusterConfig::new_with_equal_stakes(1, DEFAULT_CLUSTER_LAMPORTS, DEFAULT_NODE_STAKE);
+    // Leave enough time to acquire a lock and submit both requests in the same slot.
+    config.ticks_per_slot = 64;
+    config.poh_config = PohConfig::new_sleep(Duration::from_millis(15));
+    config.validator_configs[0]
+        .send_transaction_service_config
+        .retry_rate_ms = 100;
+    let cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let validator = cluster
+        .validators
+        .values()
+        .next()
+        .unwrap()
+        .validator
+        .as_ref()
+        .unwrap();
+    let rpc = RpcClient::new_with_commitment(
+        format!("http://{}", cluster.entry_point_info.rpc().unwrap()),
+        CommitmentConfig::processed(),
+    );
+    let recipient = Pubkey::new_unique();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let bank = loop {
+        let bank = validator.bank_forks.read().unwrap().working_bank();
+        if bank.slot() > 0
+            && bank.max_tick_height() - bank.tick_height() > bank.ticks_per_slot() / 2
+        {
+            break bank;
+        }
+        assert!(Instant::now() < deadline, "no fresh leader slot");
+        sleep(Duration::from_millis(10));
+    };
+    let tx = |amount| {
+        system_transaction::transfer(
+            &cluster.funding_keypair,
+            &recipient,
+            amount,
+            bank.last_blockhash(),
+        )
+    };
+    let lock = bank
+        .prepare_entry_batch(vec![tx(3_000_000).into()])
+        .unwrap();
+    assert_eq!(lock.lock_results(), &[Ok(())]);
+    let signatures = [1_000_000, 2_000_000].map(|amount| {
+        rpc.send_transaction_with_config(
+            &tx(amount),
+            solana_rpc_client_api::config::RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        validator.bank_forks.read().unwrap().working_bank().slot(),
+        bank.slot()
+    );
+    while validator.bank_forks.read().unwrap().working_bank().slot() == bank.slot() {
+        assert!(Instant::now() < deadline, "slot did not advance");
+        sleep(Duration::from_millis(10));
+    }
+    for signature in &signatures {
+        assert!(bank.get_signature_status(signature).is_none());
+    }
+    drop(lock);
+    // No client resubmission or manual bank execution.
+    loop {
+        let statuses = rpc.get_signature_statuses(&signatures).unwrap().value;
+        if statuses.iter().all(Option::is_some) {
+            for status in statuses.into_iter().flatten() {
+                assert_eq!(status.err, None);
+                assert!(status.slot > bank.slot());
+            }
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "accepted transfers were not retried"
+        );
+        sleep(Duration::from_millis(50));
+    }
+    assert_eq!(rpc.get_balance(&recipient).unwrap(), 3_000_000);
+}
+
+#[test]
 fn test_local_cluster_start_and_exit() {
     solana_logger::setup();
     let num_nodes = 1;

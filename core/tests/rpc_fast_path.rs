@@ -76,6 +76,30 @@ fn check_worker(method: BlockProductionMethod, is_leader: bool, vote_only: bool)
     let (vote_sender, _vote_receiver) = unbounded();
     let (fast_sender, fast_receiver) = bounded(128);
     let queue_observer = fast_receiver.clone();
+    let recipient = Pubkey::new_unique();
+    let tx = system_transaction::transfer(
+        &genesis.mint_keypair,
+        &recipient,
+        1_000_000,
+        bank.last_blockhash(),
+    );
+    fast_sender
+        .send(SanitizedTransaction::from_transaction_for_tests(tx.clone()))
+        .unwrap();
+    // Preload both copies so the worker sees a single RPC batch. There is
+    // no forwarding service in this fixture to rescue a skipped direct copy.
+    let second_recipient = Pubkey::new_unique();
+    let second = system_transaction::transfer(
+        &genesis.mint_keypair,
+        &second_recipient,
+        1_000_000,
+        bank.last_blockhash(),
+    );
+    fast_sender
+        .send(SanitizedTransaction::from_transaction_for_tests(
+            second.clone(),
+        ))
+        .unwrap();
     let stage = BankingStage::new(
         method,
         &cluster_info,
@@ -91,16 +115,6 @@ fn check_worker(method: BlockProductionMethod, is_leader: bool, vote_only: bool)
         &Arc::new(PrioritizationFeeCache::default()),
         fast_receiver,
     );
-    let recipient = Pubkey::new_unique();
-    let tx = system_transaction::transfer(
-        &genesis.mint_keypair,
-        &recipient,
-        1_000_000,
-        bank.last_blockhash(),
-    );
-    fast_sender
-        .send(SanitizedTransaction::from_transaction_for_tests(tx.clone()))
-        .unwrap();
     if is_leader && !vote_only {
         let record_deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -118,7 +132,9 @@ fn check_worker(method: BlockProductionMethod, is_leader: bool, vote_only: bool)
         }
         // Recording precedes commit. Wait for the actual public bank state.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while bank.get_signature_status(&tx.signatures[0]) != Some(Ok(())) {
+        while bank.get_signature_status(&tx.signatures[0]) != Some(Ok(()))
+            || bank.get_signature_status(&second.signatures[0]) != Some(Ok(()))
+        {
             assert!(
                 std::time::Instant::now() < deadline,
                 "direct transaction was not committed"
@@ -126,6 +142,7 @@ fn check_worker(method: BlockProductionMethod, is_leader: bool, vote_only: bool)
             thread::yield_now();
         }
         assert_eq!(bank.get_balance(&recipient), 1_000_000);
+        assert_eq!(bank.get_balance(&second_recipient), 1_000_000);
         // The reliable TPU copy must not be able to apply the transfer twice.
         loop {
             match bank.process_transaction(&tx) {
