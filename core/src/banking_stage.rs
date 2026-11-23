@@ -1217,18 +1217,24 @@ mod tests {
         // In this attack we'll demonstrate that a verifier can interpret the ledger
         // differently if either the server doesn't signal the ledger to add an
         // Entry OR if the verifier tries to parallelize across multiple Entries.
+        let minimum_balance = solana_sdk::rent::Rent::default().minimum_balance(0);
+        let mint_balance = 2 * minimum_balance;
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
             ..
-        } = create_slow_genesis_config(2);
+        } = create_slow_genesis_config(mint_balance);
         let banking_tracer = BankingTracer::new_disabled();
         let (non_vote_sender, non_vote_receiver) = banking_tracer.create_channel_non_vote();
 
-        // Process a batch that includes a transaction that receives two lamports.
+        // Process a batch that transfers the payer's entire balance.
         let alice = Keypair::new();
-        let tx =
-            system_transaction::transfer(&mint_keypair, &alice.pubkey(), 2, genesis_config.hash());
+        let tx = system_transaction::transfer(
+            &mint_keypair,
+            &alice.pubkey(),
+            mint_balance,
+            genesis_config.hash(),
+        );
 
         let packet_batches = to_packet_batches(&[tx], 1);
         let packet_batches = packet_batches
@@ -1241,8 +1247,12 @@ mod tests {
             .unwrap();
 
         // Process a second batch that uses the same from account, so conflicts with above TX
-        let tx =
-            system_transaction::transfer(&mint_keypair, &alice.pubkey(), 1, genesis_config.hash());
+        let tx = system_transaction::transfer(
+            &mint_keypair,
+            &alice.pubkey(),
+            minimum_balance,
+            genesis_config.hash(),
+        );
         let packet_batches = to_packet_batches(&[tx], 1);
         let packet_batches = packet_batches
             .into_iter()
@@ -1283,7 +1293,7 @@ mod tests {
                     non_vote_receiver,
                     tpu_vote_receiver,
                     gossip_vote_receiver,
-                    3,
+                    MIN_TOTAL_THREADS,
                     None,
                     replay_vote_sender,
                     None,
@@ -1293,12 +1303,13 @@ mod tests {
                     unbounded().1,
                 );
 
-                // wait for banking_stage to eat the packets
-                while bank.get_balance(&alice.pubkey()) < 1 {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while bank.get_balance(&alice.pubkey()) == 0 && Instant::now() < deadline {
                     sleep(Duration::from_millis(10));
                 }
                 exit.store(true, Ordering::Relaxed);
                 poh_service.join().unwrap();
+                assert!(bank.get_balance(&alice.pubkey()) >= minimum_balance);
                 entry_receiver
             };
             drop(non_vote_sender);
@@ -1319,10 +1330,11 @@ mod tests {
                     .for_each(|x| assert_eq!(*x, Ok(())));
             }
 
-            // Assert the user doesn't hold three lamports. If the stage only outputs one
-            // entry, then one of the transactions will be rejected, because it drives
-            // the account balance below zero before the credit is added.
-            assert!(bank.get_balance(&alice.pubkey()) != 3);
+            // The two transfers conflict and exceed the payer's combined balance.
+            assert_ne!(
+                bank.get_balance(&alice.pubkey()),
+                mint_balance + minimum_balance
+            );
         }
         Blockstore::destroy(ledger_path.path()).unwrap();
     }

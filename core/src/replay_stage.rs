@@ -7694,22 +7694,19 @@ pub(crate) mod tests {
         );
         assert_eq!(tower.last_voted_slot().unwrap(), 1);
 
-        // Create a bank where the last vote transaction will have expired
-        let expired_bank = {
-            let mut parent_bank = bank2.clone();
-            for _ in 0..MAX_PROCESSING_AGE {
-                let slot = parent_bank.slot() + 1;
-                parent_bank = new_bank_from_parent_with_bank_forks(
-                    bank_forks.as_ref(),
-                    parent_bank,
-                    &Pubkey::default(),
-                    slot,
-                );
-                parent_bank.fill_bank_with_ticks_for_tests();
-                parent_bank.freeze();
-            }
-            parent_bank
-        };
+        // Expire the vote transaction's blockhash while keeping the voted slot
+        // in SlotHashes so the refreshed vote can still land.
+        let expired_bank = new_bank_from_parent_with_bank_forks(
+            bank_forks.as_ref(),
+            bank2.clone(),
+            &Pubkey::default(),
+            bank2.slot() + 1,
+        );
+        for _ in 0..MAX_PROCESSING_AGE {
+            expired_bank.register_unique_recent_blockhash_for_test();
+        }
+        expired_bank.fill_bank_with_ticks_for_tests();
+        expired_bank.freeze();
 
         // Now trying to refresh the vote for slot 1 will succeed because the recent blockhash
         // of the last vote transaction has expired
