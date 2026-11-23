@@ -661,8 +661,8 @@ impl AccountsBackgroundService {
                     // snapshot requests.  This is because startup verification and snapshot
                     // request handling can both kick off accounts hash calculations in background
                     // threads, and these must not happen concurrently.
-                    let snapshot_handle_result = bank
-                        .is_startup_verification_complete()
+                    let is_startup_verification_complete = bank.is_startup_verification_complete();
+                    let snapshot_handle_result = is_startup_verification_complete
                         .then(|| {
                             request_handlers.handle_snapshot_requests(
                                 test_hash_calculation,
@@ -697,8 +697,13 @@ impl AccountsBackgroundService {
                             }
                         }
                     } else {
-                        if bank.block_height() - last_cleaned_block_height
-                            > (CLEAN_INTERVAL_BLOCKS + thread_rng().gen_range(0..10))
+                        // An EAH request may be enqueued while startup verification is ongoing,
+                        // but cannot be handled until verification completes.  Defer forced
+                        // flushing and cleaning until then so we do not clean past that request
+                        // or advance `last_cleaned_block_height` beyond its block height.
+                        if is_startup_verification_complete
+                            && bank.block_height() - last_cleaned_block_height
+                                > (CLEAN_INTERVAL_BLOCKS + thread_rng().gen_range(0..10))
                         {
                             // Note that the flush will do an internal clean of the
                             // cache up to bank.slot(), so should be safe as long
@@ -707,10 +712,7 @@ impl AccountsBackgroundService {
                             bank.force_flush_accounts_cache();
                             bank.clean_accounts(last_full_snapshot_slot);
                             last_cleaned_block_height = bank.block_height();
-                            // See justification below for why we skip 'shrink' here.
-                            if bank.is_startup_verification_complete() {
-                                bank.shrink_ancient_slots();
-                            }
+                            bank.shrink_ancient_slots();
                         }
                         // Do not 'shrink' until *after* the startup verification is complete.
                         // This is because startup verification needs to get the snapshot
@@ -719,7 +721,7 @@ impl AccountsBackgroundService {
                         // (1) could race with 'shrink', and fail to assert that shrinking is not in
                         // progress, or (2) could get snapshot storages that were newer than what
                         // was in the snapshot itself.
-                        if bank.is_startup_verification_complete() {
+                        if is_startup_verification_complete {
                             bank.shrink_candidate_slots();
                         }
                     }
@@ -912,6 +914,85 @@ mod test {
         pruned_banks_request_handler.remove_dead_slots(&bank0, &mut 0, &mut 0);
 
         assert!(bank0.rc.accounts.scan_slot(0, |_| Some(())).is_empty());
+    }
+
+    /// An EAH request can be enqueued before startup verification completes.  Ensure periodic
+    /// cleaning does not advance past it while request handling is paused.
+    #[test]
+    fn test_pending_eah_request_during_startup_verification() {
+        const EAH_SLOT: Slot = 10;
+        const ROOT_SLOT: Slot = CLEAN_INTERVAL_BLOCKS + 20;
+
+        let genesis = create_genesis_config(10);
+        let mut bank = Arc::new(Bank::new_for_tests(&genesis.genesis_config));
+        let mut eah_bank = None;
+        for slot in 1..=ROOT_SLOT {
+            bank = Arc::new(Bank::new_from_parent(
+                bank.clone(),
+                &Pubkey::new_unique(),
+                slot,
+            ));
+            if slot == EAH_SLOT {
+                bank.freeze();
+                eah_bank = Some(bank.clone());
+            }
+        }
+        bank.squash();
+        let eah_bank = eah_bank.unwrap();
+        let root_bank =
+            Arc::try_unwrap(bank).unwrap_or_else(|_| panic!("root bank has multiple refs"));
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+
+        let (snapshot_request_sender, snapshot_request_receiver) = unbounded();
+        snapshot_request_sender
+            .send(SnapshotRequest {
+                snapshot_root_bank: eah_bank,
+                status_cache_slot_deltas: Vec::default(),
+                request_kind: SnapshotRequestKind::EpochAccountsHash,
+                enqueued: Instant::now(),
+            })
+            .unwrap();
+        let (accounts_package_sender, accounts_package_receiver) = unbounded();
+        let (_pruned_banks_sender, pruned_banks_receiver) = unbounded();
+        let exit = Arc::new(AtomicBool::default());
+        let accounts_background_service = AccountsBackgroundService::new(
+            bank_forks.clone(),
+            exit.clone(),
+            AbsRequestHandlers {
+                snapshot_request_handler: SnapshotRequestHandler {
+                    snapshot_config: SnapshotConfig::default(),
+                    snapshot_request_sender,
+                    snapshot_request_receiver,
+                    accounts_package_sender,
+                },
+                pruned_banks_request_handler: PrunedBanksRequestHandler {
+                    pruned_banks_receiver,
+                },
+            },
+            false,
+            None,
+        );
+
+        // Allow multiple ABS iterations while startup verification is incomplete.  Without the
+        // startup guard, the first iteration cleans at ROOT_SLOT and advances the last-cleaned
+        // block height beyond EAH_SLOT.
+        sleep(Duration::from_secs(1));
+        bank_forks
+            .read()
+            .unwrap()
+            .root_bank()
+            .set_startup_verification_complete();
+
+        let accounts_package = accounts_package_receiver.recv_timeout(Duration::from_secs(10));
+        exit.store(true, Ordering::Relaxed);
+        accounts_background_service.join().unwrap();
+
+        let accounts_package = accounts_package.unwrap();
+        assert_eq!(
+            accounts_package.package_kind,
+            AccountsPackageKind::EpochAccountsHash
+        );
+        assert_eq!(accounts_package.slot, EAH_SLOT);
     }
 
     /// Ensure that unhandled snapshot requests are properly re-enqueued or dropped

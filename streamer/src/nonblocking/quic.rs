@@ -51,7 +51,7 @@ use {
         // but if we do, the scope of the RwLock must always be a subset of the async Mutex
         // (i.e. lock order is always async Mutex -> RwLock). Also, be careful not to
         // introduce any other awaits while holding the RwLock.
-        sync::{Mutex, MutexGuard},
+        sync::{Mutex, MutexGuard, Semaphore},
         task::JoinHandle,
         time::{sleep, timeout},
     },
@@ -159,6 +159,7 @@ pub fn spawn_server(
         staked_nodes,
         max_staked_connections,
         max_unstaked_connections,
+        max_concurrent_connections,
         max_streams_per_ms,
         stats.clone(),
         wait_for_chunk_timeout,
@@ -182,6 +183,7 @@ async fn run_server(
     staked_nodes: Arc<RwLock<StakedNodes>>,
     max_staked_connections: usize,
     max_unstaked_connections: usize,
+    max_concurrent_connections: usize,
     max_streams_per_ms: u64,
     stats: Arc<StreamStats>,
     wait_for_chunk_timeout: Duration,
@@ -199,6 +201,7 @@ async fn run_server(
     ));
     let staked_connection_table: Arc<Mutex<ConnectionTable>> =
         Arc::new(Mutex::new(ConnectionTable::new()));
+    let handshake_slots = Arc::new(Semaphore::new(max_concurrent_connections));
     let (sender, receiver) = async_unbounded();
     tokio::spawn(packet_batch_sender(
         packet_sender,
@@ -215,25 +218,52 @@ async fn run_server(
             last_datapoint = Instant::now();
         }
 
-        if let Ok(Some(connection)) = timeout_connection {
-            info!("Got a connection {:?}", connection.remote_address());
-            tokio::spawn(setup_connection(
-                connection,
-                unstaked_connection_table.clone(),
-                staked_connection_table.clone(),
-                sender.clone(),
-                max_connections_per_peer,
-                staked_nodes.clone(),
-                max_staked_connections,
-                max_unstaked_connections,
-                max_streams_per_ms,
-                stats.clone(),
-                wait_for_chunk_timeout,
-                stream_load_ema.clone(),
-            ));
-        } else {
-            debug!("accept(): Timed out waiting for connection");
+        let incoming = match timeout_connection {
+            Ok(Some(incoming)) => incoming,
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+        if !incoming.remote_address_validated() {
+            match incoming.retry() {
+                Ok(()) => {
+                    stats
+                        .total_connection_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => debug!("Incoming::retry(): error {err:?}"),
+            }
+            continue;
         }
+        // Quinn's max_incoming only counts connections that have yet to be accepted.
+        let Ok(handshake_slot) = handshake_slots.clone().try_acquire_owned() else {
+            incoming.refuse();
+            continue;
+        };
+        let connecting = match incoming.accept() {
+            Ok(connecting) => connecting,
+            Err(err) => {
+                debug!("Incoming::accept(): error {err:?}");
+                continue;
+            }
+        };
+        let setup = setup_connection(
+            connecting,
+            unstaked_connection_table.clone(),
+            staked_connection_table.clone(),
+            sender.clone(),
+            max_connections_per_peer,
+            staked_nodes.clone(),
+            max_staked_connections,
+            max_unstaked_connections,
+            max_streams_per_ms,
+            stats.clone(),
+            wait_for_chunk_timeout,
+            stream_load_ema.clone(),
+        );
+        tokio::spawn(async move {
+            let _handshake_slot = handshake_slot;
+            setup.await;
+        });
     }
 }
 
@@ -256,7 +286,7 @@ pub fn get_remote_pubkey(connection: &Connection) -> Option<Pubkey> {
     // Use the client cert only if it is self signed and the chain length is 1.
     connection
         .peer_identity()?
-        .downcast::<Vec<rustls::Certificate>>()
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
         .ok()
         .filter(|certs| certs.len() == 1)?
         .first()
@@ -1242,25 +1272,57 @@ pub mod test {
         tokio::time::sleep,
     };
 
-    struct SkipServerVerification;
+    #[derive(Debug)]
+    struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
     impl SkipServerVerification {
         fn new() -> Arc<Self> {
-            Arc::new(Self)
+            Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
         }
     }
 
-    impl rustls::client::ServerCertVerifier for SkipServerVerification {
+    impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         fn verify_server_cert(
             &self,
-            _end_entity: &rustls::Certificate,
-            _intermediates: &[rustls::Certificate],
-            _server_name: &rustls::ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
             _ocsp_response: &[u8],
-            _now: std::time::SystemTime,
-        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::ServerCertVerified::assertion())
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
         }
     }
 
@@ -1270,7 +1332,7 @@ pub mod test {
             .expect("Failed to generate client certificate");
 
         let mut crypto = rustls::ClientConfig::builder()
-            .with_safe_defaults()
+            .dangerous()
             .with_custom_certificate_verifier(SkipServerVerification::new())
             .with_client_auth_cert(vec![cert], key)
             .expect("Failed to use client certificate");
@@ -1278,7 +1340,9 @@ pub mod test {
         crypto.enable_early_data = true;
         crypto.alpn_protocols = vec![ALPN_TPU_PROTOCOL_ID.to_vec()];
 
-        let mut config = ClientConfig::new(Arc::new(crypto));
+        let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+            .expect("Failed to create QUIC client configuration");
+        let mut config = ClientConfig::new(Arc::new(quic_client_config));
 
         let mut transport_config = TransportConfig::default();
         let timeout = IdleTimeout::try_from(QUIC_MAX_TIMEOUT).unwrap();
@@ -1359,7 +1423,7 @@ pub mod test {
         for i in 0..total {
             let mut s1 = conn1.open_uni().await.unwrap();
             s1.write_all(&[0u8]).await.unwrap();
-            s1.finish().await.unwrap();
+            s1.finish().unwrap();
             info!("done {}", i);
             sleep(Duration::from_millis(1000)).await;
         }
@@ -1384,7 +1448,7 @@ pub mod test {
         let s2 = conn2.open_uni().await;
         if let Ok(mut s2) = s2 {
             s1.write_all(&[0u8]).await.unwrap();
-            s1.finish().await.unwrap();
+            s1.finish().unwrap();
             // Send enough data to create more than 1 chunks.
             // The first will try to open the connection (which should fail).
             // The following chunks will enable the detection of connection failure.
@@ -1392,9 +1456,9 @@ pub mod test {
             s2.write_all(&data)
                 .await
                 .expect_err("shouldn't be able to open 2 connections");
-            s2.finish()
+            s2.stopped()
                 .await
-                .expect_err("shouldn't be able to open 2 connections");
+                .expect_err("second connection must be closed");
         } else {
             // It has been noticed if there is already connection open against the server, this open_uni can fail
             // with ApplicationClosed(ApplicationClose) error due to CONNECTION_CLOSE_CODE_TOO_MANY before writing to
@@ -1417,9 +1481,9 @@ pub mod test {
             let mut s1 = c1.open_uni().await.unwrap();
             let mut s2 = c2.open_uni().await.unwrap();
             s1.write_all(&[0u8]).await.unwrap();
-            s1.finish().await.unwrap();
+            s1.finish().unwrap();
             s2.write_all(&[0u8]).await.unwrap();
-            s2.finish().await.unwrap();
+            s2.finish().unwrap();
             num_expected_packets += 2;
             sleep(Duration::from_millis(200)).await;
         }
@@ -1459,7 +1523,7 @@ pub mod test {
         for _ in 0..num_bytes {
             s1.write_all(&[0u8]).await.unwrap();
         }
-        s1.finish().await.unwrap();
+        s1.finish().unwrap();
 
         let mut all_packets = vec![];
         let now = Instant::now();
@@ -1494,7 +1558,8 @@ pub mod test {
                 // Ignoring any errors here. s1.finish() will test the error condition
                 s1.write_all(&[0u8]).await.unwrap_or_default();
             }
-            s1.finish().await.unwrap_err();
+            s1.finish().unwrap_or_default();
+            s1.stopped().await.unwrap_err();
         }
     }
 
@@ -1586,10 +1651,25 @@ pub mod test {
         // Test that more writes to the stream will fail (i.e. the stream is no longer writable
         // after the timeouts)
         assert!(s1.write_all(&[0u8]).await.is_err());
-        assert!(s1.finish().await.is_err());
 
         exit.store(true, Ordering::Relaxed);
         t.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_quic_server_retries_fresh_connection() {
+        let (server, exit, _receiver, server_address, stats) = setup_quic_server(None, 1);
+        let _connection = timeout(
+            Duration::from_secs(5),
+            make_client_endpoint(&server_address, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.total_connection_retries.load(Ordering::Relaxed), 1);
+
+        exit.store(true, Ordering::Relaxed);
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1630,7 +1710,7 @@ pub mod test {
 
         let mut s1 = conn1.open_uni().await.unwrap();
         s1.write_all(&[0u8]).await.unwrap();
-        s1.finish().await.unwrap();
+        s1.finish().unwrap();
 
         let mut s2 = conn2.open_uni().await.unwrap();
         conn1.close(
@@ -1644,7 +1724,7 @@ pub mod test {
         assert_eq!(stats.connection_removed.load(Ordering::Relaxed), 1);
 
         s2.write_all(&[0u8]).await.unwrap();
-        s2.finish().await.unwrap();
+        s2.finish().unwrap();
 
         conn2.close(
             CONNECTION_CLOSE_CODE_DROPPED_ENTRY.into(),

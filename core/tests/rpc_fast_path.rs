@@ -11,7 +11,10 @@ use {
         get_tmp_ledger_path_auto_delete,
     },
     solana_poh::poh_recorder::create_test_recorder,
-    solana_runtime::{bank::Bank, prioritization_fee_cache::PrioritizationFeeCache},
+    solana_runtime::{
+        bank::{Bank, NewBankOptions},
+        prioritization_fee_cache::PrioritizationFeeCache,
+    },
     solana_sdk::{
         pubkey::Pubkey,
         signature::{Keypair, Signer},
@@ -26,11 +29,29 @@ use {
     },
 };
 
-fn check_worker(method: BlockProductionMethod, is_leader: bool) {
+fn check_worker(method: BlockProductionMethod, is_leader: bool, vote_only: bool) {
     let mut genesis = create_genesis_config(1_000_000_000);
     // Leave enough real time to observe execution without a slot-boundary race.
     genesis.genesis_config.poh_config.target_tick_duration = Duration::from_millis(100);
-    let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis.genesis_config);
+    let (parent_bank, bank_forks) =
+        Bank::new_no_wallclock_throttle_for_tests(&genesis.genesis_config);
+    let bank = if vote_only {
+        let bank = Bank::new_from_parent_with_options(
+            parent_bank,
+            &Pubkey::new_unique(),
+            1,
+            NewBankOptions {
+                vote_only_bank: true,
+            },
+        );
+        bank_forks
+            .write()
+            .unwrap()
+            .insert(bank)
+            .clone_without_scheduler()
+    } else {
+        parent_bank
+    };
     let ledger = get_tmp_ledger_path_auto_delete!();
     let blockstore = Arc::new(Blockstore::open(ledger.path()).unwrap());
     let (exit, recorder, poh_service, entries) = create_test_recorder(
@@ -54,6 +75,7 @@ fn check_worker(method: BlockProductionMethod, is_leader: bool) {
     let (gossip_vote_sender, gossip_vote_receiver) = tracer.create_channel_gossip_vote();
     let (vote_sender, _vote_receiver) = unbounded();
     let (fast_sender, fast_receiver) = bounded(128);
+    let queue_observer = fast_receiver.clone();
     let stage = BankingStage::new(
         method,
         &cluster_info,
@@ -79,7 +101,7 @@ fn check_worker(method: BlockProductionMethod, is_leader: bool) {
     fast_sender
         .send(SanitizedTransaction::from_transaction_for_tests(tx.clone()))
         .unwrap();
-    if is_leader {
+    if is_leader && !vote_only {
         let record_deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let remaining = record_deadline.saturating_duration_since(std::time::Instant::now());
@@ -122,6 +144,25 @@ fn check_worker(method: BlockProductionMethod, is_leader: bool) {
         }
         assert_eq!(bank.get_balance(&recipient), 1_000_000);
     }
+    if vote_only {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while queue_observer.len() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "vote-only transaction was not drained"
+            );
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(bank.get_signature_status(&tx.signatures[0]), None);
+        assert_eq!(bank.get_balance(&recipient), 0);
+        while let Ok((_, (entry, _))) = entries.try_recv() {
+            assert!(!entry
+                .transactions
+                .iter()
+                .any(|recorded| recorded.signatures[0] == tx.signatures[0]));
+        }
+    }
     drop(fast_sender);
     drop(non_vote_sender);
     drop(tpu_vote_sender);
@@ -148,7 +189,17 @@ fn rpc_fast_path_executes_on_leader_without_tpu_round_trip() {
         BlockProductionMethod::ThreadLocalMultiIterator,
         BlockProductionMethod::CentralScheduler,
     ] {
-        check_worker(method, true);
+        check_worker(method, true, false);
+    }
+}
+
+#[test]
+fn rpc_fast_path_skips_non_votes_for_vote_only_bank() {
+    for method in [
+        BlockProductionMethod::ThreadLocalMultiIterator,
+        BlockProductionMethod::CentralScheduler,
+    ] {
+        check_worker(method, true, true);
     }
 }
 
@@ -158,6 +209,6 @@ fn rpc_fast_path_does_not_wait_for_leadership_or_hang_on_shutdown() {
         BlockProductionMethod::ThreadLocalMultiIterator,
         BlockProductionMethod::CentralScheduler,
     ] {
-        check_worker(method, false);
+        check_worker(method, false, false);
     }
 }

@@ -136,7 +136,7 @@ edition = "2021"
 [workspace.dependencies]
 Inflector = "0.11.4"
 aquamarine = "0.3.3"
-aes-gcm-siv = "0.10.3"
+aes-gcm-siv = "=0.10.3"
 ahash = "0.8.7"
 anyhow = "1.0.79"
 ark-bn254 = "0.4.0"
@@ -196,7 +196,7 @@ ed25519-dalek-bip32 = "0.2.0"
 either = "1.9.0"
 enum-iterator = "1.5.0"
 env_logger = "0.9.3"
-etcd-client = "0.11.1"
+etcd-client = "0.14.1"
 fast-math = "0.1"
 fd-lock = "3.0.13"
 flate2 = "1.0.28"
@@ -214,9 +214,10 @@ hidapi = { version = "2.4.1", default-features = false }
 histogram = "0.6.9"
 hmac = "0.12.1"
 http = "0.2.11"
+http1 = { package = "http", version = "1" }
 humantime = "2.0.1"
 hyper = "0.14.28"
-hyper-proxy = "0.9.1"
+hyper-util = "0.1.17"
 im = "15.1.0"
 index_list = "0.2.11"
 indexmap = "2.1.0"
@@ -254,7 +255,7 @@ num-derive = "0.4"
 num-traits = "0.2"
 num_cpus = "1.16.0"
 num_enum = "0.7.2"
-openssl = "0.10"
+openssl = "0.10.80"
 ouroboros = "0.15.6"
 parking_lot = "0.12"
 pbkdf2 = { version = "0.11.0", default-features = false }
@@ -267,14 +268,14 @@ pretty-hex = "0.3.0"
 prio-graph = "0.2.1"
 proc-macro2 = "1.0.78"
 proptest = "1.4"
-prost = "0.11.9"
-prost-build = "0.11.9"
-prost-types = "0.11.9"
+prost = "0.13.5"
+prost-build = "0.13.5"
+prost-types = "0.13.5"
 protobuf-src = "1.1.0"
 qstring = "0.7.2"
 qualifier_attr = { version = "0.2.2", default-features = false }
-quinn = "0.10.2"
-quinn-proto = "0.10.6"
+quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+quinn-proto = { version = "=0.11.19", default-features = false, features = ["rustls-ring", "log"] }
 quote = "1.0"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
@@ -283,11 +284,11 @@ rayon = "1.8.1"
 rcgen = "0.10.0"
 reed-solomon-erasure = "6.0.0"
 regex = "1.10.3"
-reqwest = { version = "0.11.23", default-features = false }
+reqwest = { version = "0.12.28", default-features = false }
 rolling-file = "0.2.0"
 rpassword = "7.3"
 rustc_version = "0.4"
-rustls = { version = "0.21.11", default-features = false, features = ["quic"] }
+rustls = { version = "=0.23.46", default-features = false }
 rustversion = "1.0.14"
 scopeguard = "1.2.0"
 semver = "1.0.21"
@@ -387,7 +388,7 @@ solana-wen-restart = { path = "wen-restart", version = "=1.18.21" }
 solana-zk-keygen = { path = "zk-keygen", version = "=1.18.21" }
 solana-zk-token-proof-program = { path = "programs/zk-token-proof", version = "=1.18.21" }
 solana-zk-token-sdk = { path = "zk-token-sdk", version = "=1.18.21" }
-solana_rbpf = "=0.8.0"
+solana_rbpf = "=0.8.3"
 spl-associated-token-account = "=2.3.0"
 spl-instruction-padding = "0.1"
 spl-memo = "=4.0.0"
@@ -400,7 +401,7 @@ static_assertions = "1.1.0"
 stream-cancel = "0.8.2"
 strum = "0.24"
 strum_macros = "0.24"
-subtle = "2.4.1"
+subtle = "=2.5.0"
 symlink = "0.1.0"
 syn = "2.0"
 sys-info = "0.9.1"
@@ -412,17 +413,16 @@ tempfile = "3.9.0"
 test-case = "3.3.1"
 thiserror = "1.0.56"
 tiny-bip39 = "0.8.2"
-# Update solana-tokio patch below when updating this version
-tokio = "1.29.1"
+tokio = "1.53.3"
 tokio-serde = "0.8"
 tokio-stream = "0.1.14"
-tokio-tungstenite = "0.20.1"
+tokio-tungstenite = "0.24.0"
 tokio-util = "0.6"
 toml = "0.8.8"
-tonic = "0.9.2"
-tonic-build = "0.9.2"
+tonic = "0.12.3"
+tonic-build = "0.12.3"
 trees = "0.4.2"
-tungstenite = "0.20.1"
+tungstenite = { version = "0.24.0", features = ["url"] }
 uriparse = "0.6.4"
 url = "2.5.0"
 wasm-bindgen = "0.2"
@@ -491,25 +491,10 @@ solana-zk-token-sdk = { path = "zk-token-sdk" }
 # When our dependencies are upgraded, we can remove these patches.  Before that
 # we might need to maintain these patches in sync with our full dependency tree.
 
-# Our dependency tree has `aes-gcm-siv` v0.10.3 and the `zeroize` restriction
-# was removed in the next commit just after the release.  So it seems safe to
-# patch to this commit.
-#
-# `aes-gcm-siv` v0.10.3 release:
-#
-# https://github.com/RustCrypto/AEADs/releases/tag/aes-gcm-siv-v0.10.3
-#
-# Corresponds to commit
-#
-# https://github.com/RustCrypto/AEADs/commit/6f16f4577a1fc839a2346cf8c5531c85a44bf5c0
-#
-# Comparison with `6105d7a5591aefa646a95d12b5e8d3f55a9214ef` pinned here:
-#
-# https://github.com/RustCrypto/AEADs/compare/aes-gcm-siv-v0.10.3..6105d7a5591aefa646a95d12b5e8d3f55a9214ef
-#
+# Retain the aes-gcm-siv 0.10 API while allowing subtle 2.5, required by rustls 0.23.
 [patch.crates-io.aes-gcm-siv]
 git = "https://github.com/RustCrypto/AEADs"
-rev = "6105d7a5591aefa646a95d12b5e8d3f55a9214ef"
+rev = "e1e35e0c4f4943da0a99ceb8477c421dcfae2c33"
 
 # We maintain a fork of `curve25519-dalek`. Within the forked repository,
 # the `3.2.1-fix-audit` branch contains patches for two issues:
@@ -558,21 +543,3 @@ rev = "6105d7a5591aefa646a95d12b5e8d3f55a9214ef"
 [patch.crates-io.curve25519-dalek]
 git = "https://github.com/anza-xyz/curve25519-dalek.git"
 rev = "0382b672560493840f453f2a0e24c4a129abd3a4"
-
-# Solana RPC nodes experience stalls when running with `tokio` containing this
-# commit:
-# https://github.com/tokio-rs/tokio/commit/4eed411519783ef6f58cbf74f886f91142b5cfa6
-#
-# Tokio maintainers believe performance degradation is due to application bugs:
-# https://github.com/tokio-rs/tokio/issues/4873#issuecomment-1198277677
-#
-# This may indeed be true of the code in this monorepo, but we haven't yet
-# identified the bug or a way to fix. As a stopgap, this patches `tokio` to the
-# tagged version specified above with commit `4eed411` reverted.
-#
-# Comparison:
-# https://github.com/tokio-rs/tokio/compare/tokio-1.29.1...solana-labs:solana-tokio:tokio-1.29.1-revert-4eed411
-#
-[patch.crates-io.tokio]
-git = "https://github.com/anza-xyz/solana-tokio.git"
-rev = "7cf47705faacf7bf0e43e4131a5377b3291fce21"

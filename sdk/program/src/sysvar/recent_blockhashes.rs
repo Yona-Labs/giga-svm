@@ -25,6 +25,8 @@ use {
     std::{cmp::Ordering, collections::BinaryHeap, iter::FromIterator, ops::Deref},
 };
 
+/// Keep this sysvar small enough to deserialize within the default SBF heap.
+/// The runtime blockhash queue has a separate processing-age limit.
 #[deprecated(
     since = "1.9.0",
     note = "Please do not use, will no longer be available in the future"
@@ -148,8 +150,8 @@ impl<T: Ord> Iterator for IntoIterSorted<T> {
 
 impl Sysvar for RecentBlockhashes {
     fn size_of() -> usize {
-        // hard-coded so that we don't have to construct an empty
-        6008 // golden, update if MAX_ENTRIES changes
+        // Vec header plus 32-byte blockhash and 8-byte fee calculator per entry.
+        8 + 40 * MAX_ENTRIES
     }
 }
 
@@ -162,17 +164,11 @@ impl Deref for RecentBlockhashes {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::clock::MAX_PROCESSING_AGE};
-
-    #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn test_sysvar_can_hold_all_active_blockhashes() {
-        // Ensure we can still hold all of the active entries in `BlockhashQueue`
-        assert!(MAX_PROCESSING_AGE <= MAX_ENTRIES);
-    }
+    use super::*;
 
     #[test]
     fn test_size_of() {
+        assert_eq!(RecentBlockhashes::size_of(), 6008);
         let entry = Entry::new(&Hash::default(), 0);
         assert_eq!(
             bincode::serialized_size(&RecentBlockhashes(vec![entry; MAX_ENTRIES])).unwrap()

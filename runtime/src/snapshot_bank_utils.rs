@@ -847,16 +847,21 @@ fn verify_slot_deltas(
     verify_slot_deltas_with_history(&info.slots, &bank.get_slot_history(), bank.slot())
 }
 
+const MAX_SLOT_DELTA_ENTRIES: usize = 4000;
+
 /// Verify that the snapshot's slot deltas are not corrupt/invalid
 /// These checks are simple/structural
 fn verify_slot_deltas_structural(
     slot_deltas: &[BankSlotDelta],
     bank_slot: Slot,
 ) -> std::result::Result<VerifySlotDeltasStructuralInfo, VerifySlotDeltasError> {
-    // there should not be more entries than that status cache's max
+    // Allow the full live status-cache window plus margin for fork-specific timing.
     let num_entries = slot_deltas.len();
-    if num_entries > 4000 {
-        return Err(VerifySlotDeltasError::TooManyEntries(num_entries, 4000));
+    if num_entries > MAX_SLOT_DELTA_ENTRIES {
+        return Err(VerifySlotDeltasError::TooManyEntries(
+            num_entries,
+            MAX_SLOT_DELTA_ENTRIES,
+        ));
     }
 
     let mut slots_seen_so_far = HashSet::new();
@@ -2474,7 +2479,7 @@ mod tests {
 
     #[test]
     fn test_verify_slot_deltas_structural_bad_too_many_entries() {
-        let bank_slot = status_cache::MAX_CACHE_ENTRIES as Slot + 1;
+        let bank_slot = MAX_SLOT_DELTA_ENTRIES as Slot + 1;
         let slot_deltas: Vec<_> = (0..bank_slot)
             .map(|slot| (slot, true, Status::default()))
             .collect();
@@ -2483,8 +2488,8 @@ mod tests {
         assert_eq!(
             result,
             Err(VerifySlotDeltasError::TooManyEntries(
-                status_cache::MAX_CACHE_ENTRIES + 1,
-                status_cache::MAX_CACHE_ENTRIES
+                MAX_SLOT_DELTA_ENTRIES + 1,
+                MAX_SLOT_DELTA_ENTRIES
             )),
         );
     }

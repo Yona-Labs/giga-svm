@@ -192,7 +192,7 @@ impl DuplicateShredHandler {
                     }
             });
         }
-        if self.buffer.len() < BUFFER_CAPACITY {
+        if self.buffer.len() <= BUFFER_CAPACITY {
             return;
         }
         // Lookup stake for each entry.
@@ -478,6 +478,35 @@ mod tests {
         }
         assert!(blockstore.has_duplicate_shreds_in_slot(start_slot));
         assert_eq!(receiver.try_iter().collect_vec(), vec![start_slot]);
+    }
+
+    #[test]
+    fn test_prune_buffer_exact_capacity_after_filtering() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let genesis_config =
+            create_genesis_config_with_leader(10_000, &Pubkey::new_unique(), 10_000).genesis_config;
+        let bank = Bank::new_for_tests(&genesis_config);
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let (sender, _receiver) = unbounded();
+        let mut handler =
+            DuplicateShredHandler::new(blockstore, leader_schedule_cache, bank_forks, sender, 0);
+
+        // Trigger pruning at twice the capacity. Filtering stale entries then
+        // leaves exactly BUFFER_CAPACITY live entries, which used to panic.
+        for _ in 0..BUFFER_CAPACITY {
+            handler
+                .buffer
+                .insert((0, Pubkey::new_unique()), BufferEntry::default());
+            handler
+                .buffer
+                .insert((1, Pubkey::new_unique()), BufferEntry::default());
+        }
+        assert_eq!(handler.buffer.len(), 2 * BUFFER_CAPACITY);
+        handler.maybe_prune_buffer();
+        assert_eq!(handler.buffer.len(), BUFFER_CAPACITY);
+        assert!(handler.buffer.keys().all(|(slot, _)| *slot > 0));
     }
 
     #[test]

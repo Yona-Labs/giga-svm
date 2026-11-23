@@ -103,12 +103,17 @@ impl CiphertextCiphertextEqualityProof {
         transcript.append_point(b"Y_3", &Y_3);
 
         let c = transcript.challenge_scalar(b"c");
-        transcript.challenge_scalar(b"w");
 
         // compute the masked values
         let z_s = &(&c * s) + &y_s;
         let z_x = &(&c * &x) + &y_x;
         let z_r = &(&c * r) + &y_r;
+
+        // compute challenge `w` for consistency with verification
+        transcript.append_scalar(b"z_s", &z_s);
+        transcript.append_scalar(b"z_x", &z_x);
+        transcript.append_scalar(b"z_r", &z_r);
+        transcript.challenge_scalar(b"w");
 
         // zeroize random scalars
         y_s.zeroize();
@@ -159,6 +164,10 @@ impl CiphertextCiphertextEqualityProof {
         transcript.validate_and_append_point(b"Y_3", &self.Y_3)?;
 
         let c = transcript.challenge_scalar(b"c");
+
+        transcript.append_scalar(b"z_s", &self.z_s);
+        transcript.append_scalar(b"z_x", &self.z_x);
+        transcript.append_scalar(b"z_r", &self.z_r);
         let w = transcript.challenge_scalar(b"w"); // w used for batch verification
         let ww = &w * &w;
         let www = &w * &ww;
@@ -335,6 +344,63 @@ mod test {
                 &source_ciphertext,
                 &destination_ciphertext,
                 &mut verifier_transcript
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_ciphertext_ciphertext_equality_proof_response_binding() {
+        let source_keypair = ElGamalKeypair::new_rand();
+        let destination_keypair = ElGamalKeypair::new_rand();
+        let message = 55_u64;
+
+        let source_opening = PedersenOpening::new_rand();
+        let source_ciphertext = source_keypair
+            .pubkey()
+            .encrypt_with(message, &source_opening);
+        let destination_opening = PedersenOpening::new_rand();
+        let destination_ciphertext = destination_keypair
+            .pubkey()
+            .encrypt_with(message, &destination_opening);
+
+        let mut prover_transcript = Transcript::new(b"Test");
+        let mut proof = CiphertextCiphertextEqualityProof::new(
+            &source_keypair,
+            destination_keypair.pubkey(),
+            &source_ciphertext,
+            &destination_opening,
+            message,
+            &mut prover_transcript,
+        );
+
+        // Craft responses that satisfy the batch verification relation under the original
+        // challenge, which was derived without binding the responses.
+        let mut challenge_transcript = Transcript::new(b"Test");
+        challenge_transcript.equality_proof_domain_separator();
+        challenge_transcript.append_point(b"Y_0", &proof.Y_0);
+        challenge_transcript.append_point(b"Y_1", &proof.Y_1);
+        challenge_transcript.append_point(b"Y_2", &proof.Y_2);
+        challenge_transcript.append_point(b"Y_3", &proof.Y_3);
+        challenge_transcript.challenge_scalar(b"c");
+        let w = challenge_transcript.challenge_scalar(b"w");
+        let ww = w * w;
+        let www = ww * w;
+
+        let source_response_delta = Scalar::one();
+        let destination_response_delta = -source_keypair.secret().get_scalar()
+            * (Scalar::one() + w * source_opening.get_scalar())
+            * (ww + www * destination_keypair.secret().get_scalar()).invert();
+        proof.z_s += source_response_delta;
+        proof.z_r += destination_response_delta;
+
+        let mut verifier_transcript = Transcript::new(b"Test");
+        assert!(proof
+            .verify(
+                source_keypair.pubkey(),
+                destination_keypair.pubkey(),
+                &source_ciphertext,
+                &destination_ciphertext,
+                &mut verifier_transcript,
             )
             .is_err());
     }

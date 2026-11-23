@@ -3,6 +3,7 @@
 //! can do its processing in parallel with signature verification on the GPU.
 
 use crossbeam_channel::TryRecvError;
+use solana_sdk::transaction::SanitizedTransaction;
 use {
     self::{
         committer::Committer,
@@ -50,7 +51,6 @@ use {
         time::{Duration, Instant},
     },
 };
-use solana_sdk::transaction::SanitizedTransaction;
 
 // Below modules are pub to allow use by banking_stage bench
 pub mod committer;
@@ -498,7 +498,14 @@ impl BankingStage {
             })
             .collect();
 
-        bank_thread_hdls.push(Self::spawn_process_rpc_transactions_thread(2, receiver, decision_maker.clone(), committer.clone(), transaction_recorder.clone(), log_messages_bytes_limit));
+        bank_thread_hdls.push(Self::spawn_process_rpc_transactions_thread(
+            2,
+            receiver,
+            decision_maker.clone(),
+            committer.clone(),
+            transaction_recorder.clone(),
+            log_messages_bytes_limit,
+        ));
 
         Self { bank_thread_hdls }
     }
@@ -565,7 +572,14 @@ impl BankingStage {
             ));
         }
 
-        bank_thread_hdls.push(Self::spawn_process_rpc_transactions_thread(2, receiver, decision_maker.clone(), committer.clone(), transaction_recorder.clone(), log_messages_bytes_limit));
+        bank_thread_hdls.push(Self::spawn_process_rpc_transactions_thread(
+            2,
+            receiver,
+            decision_maker.clone(),
+            committer.clone(),
+            transaction_recorder.clone(),
+            log_messages_bytes_limit,
+        ));
 
         // Create channels for communication between scheduler and workers
         let num_workers = (num_threads).saturating_sub(NUM_VOTE_PROCESSING_THREADS);
@@ -692,35 +706,51 @@ impl BankingStage {
                         match receiver.try_recv() {
                             Ok(tx) => {
                                 tx_buffer.push(tx);
-                                if tx_buffer.len() >= 128 || recv_start.elapsed().as_micros() >= 100 {
+                                if tx_buffer.len() >= 128 || recv_start.elapsed().as_micros() >= 100
+                                {
                                     break;
                                 }
-                            },
+                            }
                             Err(TryRecvError::Disconnected) => break,
                             Err(TryRecvError::Empty) => {
-                                if !tx_buffer.is_empty() && recv_start.elapsed().as_micros() >= 100  {
+                                if !tx_buffer.is_empty() && recv_start.elapsed().as_micros() >= 100
+                                {
                                     break;
                                 }
-                            },
+                            }
                         };
                     }
 
-                    let bank_start = DecisionMaker::bank_start(
-                        &decision_maker.poh_recorder.read().unwrap(),
-                    );
+                    let bank_start =
+                        DecisionMaker::bank_start(&decision_maker.poh_recorder.read().unwrap());
                     if let Some(bank_start) = bank_start {
-                        let before_process = Instant::now();
-                        // This copy may race a slot boundary or encounter locked accounts.
-                        // The normal send service retains the transaction for retry.
-                        consumer.process_packets_transactions(
-                            &bank_start.working_bank,
-                            &bank_start.bank_creation_time,
-                            &tx_buffer,
-                            &banking_stage_stats,
-                            &mut slot_metrics_tracker,
-                        );
-                        datapoint_info!("process-packets-transactions", ("process_time", before_process.elapsed().as_micros() as i64, i64));
-                        datapoint_info!("bank-process_transactions", ("tx_count", tx_buffer.len() as i64, i64));
+                        if bank_start.working_bank.vote_only_bank() {
+                            tx_buffer.retain(|tx| tx.is_simple_vote_transaction());
+                        }
+                        if !tx_buffer.is_empty() {
+                            let before_process = Instant::now();
+                            // This copy may race a slot boundary or encounter locked accounts.
+                            // The normal send service retains the transaction for retry.
+                            consumer.process_packets_transactions(
+                                &bank_start.working_bank,
+                                &bank_start.bank_creation_time,
+                                &tx_buffer,
+                                &banking_stage_stats,
+                                &mut slot_metrics_tracker,
+                            );
+                            datapoint_info!(
+                                "process-packets-transactions",
+                                (
+                                    "process_time",
+                                    before_process.elapsed().as_micros() as i64,
+                                    i64
+                                )
+                            );
+                            datapoint_info!(
+                                "bank-process_transactions",
+                                ("tx_count", tx_buffer.len() as i64, i64)
+                            );
+                        }
                     }
                     // Never wait for our own leadership; the regular copy is forwarded.
                     tx_buffer.clear();
@@ -953,6 +983,7 @@ mod tests {
                 Arc::new(ConnectionCache::new("connection_cache_test")),
                 bank_forks,
                 &Arc::new(PrioritizationFeeCache::new(0u64)),
+                unbounded().1,
             );
             drop(non_vote_sender);
             drop(tpu_vote_sender);
@@ -1008,6 +1039,7 @@ mod tests {
                 Arc::new(ConnectionCache::new("connection_cache_test")),
                 bank_forks,
                 &Arc::new(PrioritizationFeeCache::new(0u64)),
+                unbounded().1,
             );
             trace!("sending bank");
             drop(non_vote_sender);
@@ -1087,6 +1119,7 @@ mod tests {
                 Arc::new(ConnectionCache::new("connection_cache_test")),
                 bank_forks,
                 &Arc::new(PrioritizationFeeCache::new(0u64)),
+                unbounded().1,
             );
 
             // fund another account so we can send 2 good transactions in a single batch.
@@ -1257,6 +1290,7 @@ mod tests {
                     Arc::new(ConnectionCache::new("connection_cache_test")),
                     bank_forks,
                     &Arc::new(PrioritizationFeeCache::new(0u64)),
+                    unbounded().1,
                 );
 
                 // wait for banking_stage to eat the packets
@@ -1448,6 +1482,7 @@ mod tests {
                 Arc::new(ConnectionCache::new("connection_cache_test")),
                 bank_forks,
                 &Arc::new(PrioritizationFeeCache::new(0u64)),
+                unbounded().1,
             );
 
             let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();

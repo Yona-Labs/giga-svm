@@ -142,6 +142,11 @@ impl FeeSigmaProof {
         transcript.append_point(b"Y_delta", &fee_equality_proof.Y_delta);
         transcript.append_point(b"Y_claimed", &fee_equality_proof.Y_claimed);
         transcript.challenge_scalar(b"c");
+        transcript.append_scalar(b"z_max", &fee_max_proof.z_max_proof);
+        transcript.append_scalar(b"c_max_proof", &fee_max_proof.c_max_proof);
+        transcript.append_scalar(b"z_x", &fee_equality_proof.z_x);
+        transcript.append_scalar(b"z_delta_real", &fee_equality_proof.z_delta);
+        transcript.append_scalar(b"z_claimed", &fee_equality_proof.z_claimed);
         transcript.challenge_scalar(b"w");
 
         Self {
@@ -205,9 +210,15 @@ impl FeeSigmaProof {
         let c = transcript.challenge_scalar(b"c");
         let c_max_proof = c - c_equality;
 
-        transcript.challenge_scalar(b"w");
-
         let z_max_proof = c_max_proof * r_fee + y_max_proof;
+
+        // compute challenge `w` for consistency with verification
+        transcript.append_scalar(b"z_max", &z_max_proof);
+        transcript.append_scalar(b"c_max_proof", &c_max_proof);
+        transcript.append_scalar(b"z_x", &z_x);
+        transcript.append_scalar(b"z_delta_real", &z_delta);
+        transcript.append_scalar(b"z_claimed", &z_claimed);
+        transcript.challenge_scalar(b"w");
 
         let fee_max_proof = FeeMaxProof {
             Y_max_proof,
@@ -279,11 +290,17 @@ impl FeeSigmaProof {
         let c = transcript.challenge_scalar(b"c");
         let c_equality = c - c_max_proof;
 
-        transcript.challenge_scalar(b"w");
-
         let z_x = c_equality * x + y_x;
         let z_delta = c_equality * r_delta + y_delta;
         let z_claimed = c_equality * r_claimed + y_claimed;
+
+        // compute challenge `w` for consistency with verification
+        transcript.append_scalar(b"z_max", &z_max_proof);
+        transcript.append_scalar(b"c_max_proof", &c_max_proof);
+        transcript.append_scalar(b"z_x", &z_x);
+        transcript.append_scalar(b"z_delta_real", &z_delta);
+        transcript.append_scalar(b"z_claimed", &z_claimed);
+        transcript.challenge_scalar(b"w");
 
         let fee_equality_proof = FeeEqualityProof {
             Y_delta,
@@ -350,6 +367,11 @@ impl FeeSigmaProof {
         let c_max_proof = self.fee_max_proof.c_max_proof;
         let c_equality = c - c_max_proof;
 
+        transcript.append_scalar(b"z_max", &z_max);
+        transcript.append_scalar(b"c_max_proof", &c_max_proof);
+        transcript.append_scalar(b"z_x", &z_x);
+        transcript.append_scalar(b"z_delta_real", &z_delta_real);
+        transcript.append_scalar(b"z_claimed", &z_claimed);
         let w = transcript.challenge_scalar(b"w");
         let ww = w * w;
 
@@ -652,5 +674,48 @@ mod test {
                 &mut verifier_transcript,
             )
             .is_ok());
+    }
+
+    #[test]
+    fn test_fee_proof_c_max_proof_binding() {
+        let max_fee = 3_u64;
+        let (fee_commitment, fee_opening) = Pedersen::new(max_fee);
+        let (delta_commitment, delta_opening) = Pedersen::new(0_u64);
+        let (claimed_commitment, claimed_opening) = Pedersen::new(0_u64);
+
+        let mut prover_transcript = Transcript::new(b"test");
+        let mut proof = FeeSigmaProof::new(
+            (max_fee + 1, &fee_commitment, &fee_opening),
+            (0, &delta_commitment, &delta_opening),
+            (&claimed_commitment, &claimed_opening),
+            max_fee,
+            &mut prover_transcript,
+        );
+
+        // Adjust the max-proof challenge and response so that the original, unbound batching
+        // challenge would still verify the proof.
+        let mut challenge_transcript = Transcript::new(b"test");
+        challenge_transcript.append_point(b"Y_max_proof", &proof.fee_max_proof.Y_max_proof);
+        challenge_transcript.append_point(b"Y_delta", &proof.fee_equality_proof.Y_delta);
+        challenge_transcript.append_point(b"Y_claimed", &proof.fee_equality_proof.Y_claimed);
+        challenge_transcript.challenge_scalar(b"c");
+        let w = challenge_transcript.challenge_scalar(b"w");
+        let ww = w * w;
+
+        proof.fee_max_proof.c_max_proof += Scalar::one();
+        proof.fee_max_proof.z_max_proof -= fee_opening.get_scalar()
+            + w * delta_opening.get_scalar()
+            + ww * claimed_opening.get_scalar();
+
+        let mut verifier_transcript = Transcript::new(b"test");
+        assert!(proof
+            .verify(
+                &fee_commitment,
+                &delta_commitment,
+                &claimed_commitment,
+                max_fee,
+                &mut verifier_transcript,
+            )
+            .is_err());
     }
 }

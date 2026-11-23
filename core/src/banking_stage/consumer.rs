@@ -408,7 +408,10 @@ impl Consumer {
             .iter()
             .zip(check_results)
             .map(|(tx, (result, _nonce))| match result {
-                Ok(_) => tx.verify_precompiles(&bank.feature_set),
+                Ok(_) => {
+                    tx.verify_precompiles(&bank.feature_set)?;
+                    Self::check_loaded_addresses(bank, tx)
+                }
                 Err(err) => Err(err),
             })
             .collect();
@@ -452,16 +455,25 @@ impl Consumer {
             } else {
                 // Verify pre-compiles.
                 tx.verify_precompiles(&bank.feature_set)?;
-                // Any transaction executed between sanitization time and now may have closed the lookup table(s).
-                // Above re-sanitization already loads addresses, so don't need to re-check in that case.
-                let lookup_tables = tx.message().message_address_table_lookups();
-                if !lookup_tables.is_empty() {
-                    bank.load_addresses(lookup_tables)?;
-                }
+                Self::check_loaded_addresses(bank, tx)?;
             }
             Ok(())
         });
         self.process_and_record_transactions_with_pre_results(bank, txs, 0, pre_results)
+    }
+
+    fn check_loaded_addresses(
+        bank: &Bank,
+        tx: &SanitizedTransaction,
+    ) -> Result<(), TransactionError> {
+        let lookup_tables = tx.message().message_address_table_lookups();
+        // The bank that sanitized the transaction may have seen a different fork.
+        if !lookup_tables.is_empty()
+            && bank.load_addresses(lookup_tables)? != tx.get_loaded_addresses()
+        {
+            return Err(TransactionError::ResanitizationNeeded);
+        }
+        Ok(())
     }
 
     fn process_and_record_transactions_with_pre_results(
@@ -851,6 +863,7 @@ mod tests {
             pubkey::Pubkey,
             signature::Keypair,
             signer::Signer,
+            slot_hashes::SlotHashes,
             system_instruction, system_program, system_transaction,
             transaction::{MessageHash, Transaction, VersionedTransaction},
         },
@@ -2103,6 +2116,132 @@ mod tests {
             let _ = poh_simulator.join();
         }
         Blockstore::destroy(ledger_path.path()).unwrap();
+    }
+
+    #[test_case::test_case(false; "closed_table")]
+    #[test_case::test_case(true; "different_addresses_on_fork")]
+    fn test_process_and_record_rechecks_lookup_tables(table_still_loads: bool) {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_slow_genesis_config(10_000);
+        let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let keypair = Keypair::new();
+        bank.transfer(1, &mint_keypair, &keypair.pubkey()).unwrap();
+
+        let address_table_key = Pubkey::new_unique();
+        let address_table_state = generate_new_address_lookup_table(None, 2);
+        store_address_lookup_table(&bank, address_table_key, address_table_state.clone());
+        let rpc_bank = Bank::new_from_parent(bank.clone(), &Pubkey::new_unique(), 1);
+        let rpc_bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(rpc_bank)
+            .clone_without_scheduler();
+        let message = VersionedMessage::V0(v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            recent_blockhash: genesis_config.hash(),
+            account_keys: vec![keypair.pubkey()],
+            address_table_lookups: vec![MessageAddressTableLookup {
+                account_key: address_table_key,
+                writable_indexes: vec![0],
+                readonly_indexes: vec![1],
+            }],
+            instructions: vec![],
+        });
+        let tx = VersionedTransaction::try_new(message, &[&keypair]).unwrap();
+        let sanitized_tx = SanitizedTransaction::try_create(
+            tx,
+            MessageHash::Compute,
+            Some(false),
+            rpc_bank.as_ref(),
+        )
+        .unwrap();
+
+        // The working bank can belong to a different fork from the RPC bank.
+        let new_bank = Bank::new_from_parent(bank, &Pubkey::new_unique(), 2);
+        let bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(new_bank)
+            .clone_without_scheduler();
+        let lookups = sanitized_tx.message().message_address_table_lookups();
+        if table_still_loads {
+            let other_table = generate_new_address_lookup_table(None, 2);
+            store_address_lookup_table(&bank, address_table_key, other_table);
+            assert_ne!(
+                bank.load_addresses(lookups).unwrap(),
+                sanitized_tx.get_loaded_addresses()
+            );
+        } else {
+            let mut deactivated_table = address_table_state;
+            deactivated_table.meta.deactivation_slot = rpc_bank.slot();
+            store_address_lookup_table(&bank, address_table_key, deactivated_table);
+            bank.set_sysvar_for_tests(&SlotHashes::default());
+            assert_eq!(
+                bank.load_addresses(lookups),
+                Err(solana_sdk::message::AddressLoaderError::LookupTableAccountNotFound)
+            );
+        }
+
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let (poh_recorder, entry_receiver, record_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            blockstore,
+            &Arc::new(LeaderScheduleCache::new_from_bank(&bank)),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+        let recorder = poh_recorder.new_recorder();
+        let poh_recorder = Arc::new(RwLock::new(poh_recorder));
+        let poh_simulator = simulate_poh(record_receiver, &poh_recorder);
+        poh_recorder
+            .write()
+            .unwrap()
+            .set_bank_for_test(bank.clone());
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let committer = Committer::new(
+            None,
+            replay_vote_sender,
+            Arc::new(PrioritizationFeeCache::new(0)),
+        );
+        let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
+        let output =
+            consumer.process_and_record_transactions(&bank, std::slice::from_ref(&sanitized_tx), 0);
+        let output = output.execute_and_commit_transactions_output;
+        assert_eq!(output.transactions_attempted_execution_count, 1);
+        assert_eq!(output.executed_transactions_count, 0);
+        assert!(output.commit_transactions_result.is_ok());
+        while let Ok((_, (entry, _))) = entry_receiver.try_recv() {
+            assert!(entry.transactions.is_empty());
+        }
+
+        if table_still_loads {
+            let resolved_tx = bank
+                .fully_verify_transaction(sanitized_tx.to_versioned_transaction())
+                .unwrap();
+            let output = consumer.process_and_record_transactions(&bank, &[resolved_tx], 0);
+            let output = output.execute_and_commit_transactions_output;
+            assert_eq!(output.executed_with_successful_result_count, 1);
+            assert!(output.commit_transactions_result.is_ok());
+        }
+
+        poh_recorder
+            .read()
+            .unwrap()
+            .is_exited
+            .store(true, Ordering::Relaxed);
+        poh_simulator.join().unwrap();
     }
 
     #[test]

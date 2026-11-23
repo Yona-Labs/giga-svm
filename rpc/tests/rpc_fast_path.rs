@@ -30,7 +30,7 @@ use {
         pubkey::Pubkey,
         signature::{Keypair, Signature, Signer},
         system_instruction, system_transaction,
-        transaction::{SanitizedTransaction, Transaction, VersionedTransaction},
+        transaction::{SanitizedTransaction, Transaction, TransactionError, VersionedTransaction},
     },
     solana_send_transaction_service::send_transaction_service,
     solana_streamer::socket::SocketAddrSpace,
@@ -58,7 +58,7 @@ impl Drop for RpcGuard {
 }
 
 fn with_rpc(
-    test: impl FnOnce(&RpcClient, &Bank, &Keypair, Receiver<SanitizedTransaction>, &UdpSocket),
+    test: impl FnOnce(&RpcClient, &Arc<Bank>, &Keypair, Receiver<SanitizedTransaction>, &UdpSocket),
 ) {
     let ledger = get_tmp_ledger_path_auto_delete!();
     let genesis = create_genesis_config(1_000_000_000);
@@ -406,17 +406,48 @@ fn rpc_fast_path_forwards_when_direct_worker_is_disconnected() {
 }
 
 #[test]
-fn rpc_fast_path_retries_without_local_leadership() {
+fn rpc_fast_path_retries_account_contention_across_slots() {
     with_rpc(|client, bank, mint, _fast, tpu| {
-        let tx = transfer(bank, mint);
+        let leader_id = Pubkey::new_unique();
+        let leader = Arc::new(Bank::new_from_parent(
+            bank.clone(),
+            &leader_id,
+            bank.slot() + 1,
+        ));
+        let recipient = Pubkey::new_unique();
+        let transfer =
+            system_transaction::transfer(mint, &recipient, 1_000_000, leader.last_blockhash());
+        let tx = VersionedTransaction::from(transfer.clone());
+        let competing_transfer = system_transaction::transfer(
+            mint,
+            &Pubkey::new_unique(),
+            1_000_000,
+            leader.last_blockhash(),
+        );
+        let account_lock = leader
+            .prepare_entry_batch(vec![competing_transfer.into()])
+            .unwrap();
+        assert_eq!(account_lock.lock_results(), &[Ok(())]);
+
         let signature: String = client.send(RpcRequest::SendTransaction, json!([
             STANDARD.encode(bincode::serialize(&tx).unwrap()),
             {"encoding": "base64", "skipPreflight": true, "preflightCommitment": "processed", "maxRetries": 1}
         ])).unwrap();
         assert_eq!(signature, tx.signatures[0].to_string());
         assert_forwarded(tpu, &tx);
+        assert_eq!(
+            leader.process_transaction(&transfer),
+            Err(TransactionError::AccountInUse)
+        );
+        assert_eq!(leader.get_signature_status(&tx.signatures[0]), None);
+        drop(account_lock);
+
+        let next_slot = leader.slot() + 1;
+        let next_leader = Bank::new_from_parent(leader, &leader_id, next_slot);
         // A distinct second datagram must come from the normal retry loop.
         assert_forwarded(tpu, &tx);
+        assert_eq!(next_leader.process_transaction(&transfer), Ok(()));
+        assert_eq!(next_leader.get_balance(&recipient), 1_000_000);
     });
 }
 

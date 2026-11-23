@@ -99,11 +99,15 @@ impl GroupedCiphertext2HandlesValidityProof {
         transcript.append_point(b"Y_2", &Y_2);
 
         let c = transcript.challenge_scalar(b"c");
-        transcript.challenge_scalar(b"w");
 
         // compute masked message and opening
         let z_r = &(&c * r) + &y_r;
         let z_x = &(&c * &x) + &y_x;
+
+        // compute challenge `w` for consistency with verification
+        transcript.append_scalar(b"z_r", &z_r);
+        transcript.append_scalar(b"z_x", &z_x);
+        transcript.challenge_scalar(b"w");
 
         y_r.zeroize();
         y_x.zeroize();
@@ -140,6 +144,9 @@ impl GroupedCiphertext2HandlesValidityProof {
         transcript.append_point(b"Y_2", &self.Y_2);
 
         let c = transcript.challenge_scalar(b"c");
+
+        transcript.append_scalar(b"z_r", &self.z_r);
+        transcript.append_scalar(b"z_x", &self.z_x);
         let w = transcript.challenge_scalar(b"w");
         let ww = &w * &w;
 

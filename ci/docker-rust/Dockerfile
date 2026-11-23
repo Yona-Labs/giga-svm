@@ -1,7 +1,7 @@
 FROM ubuntu:20.04
 
 ARG \
-  RUST_VERSION=1.75.0 \
+  RUST_VERSION=1.85.0 \
   GOLANG_VERSION=1.21.3 \
   NODE_MAJOR=18 \
   SCCACHE_VERSION=v0.5.4
@@ -47,6 +47,7 @@ RUN apt-get update && \
   clang \
   cmake \
   make \
+  perl \
   libprotobuf-dev \
   protobuf-compiler \
   && \
@@ -66,7 +67,7 @@ RUN apt-get update && \
   rustup component add rustfmt && \
   rustup component add clippy && \
   rustup target add wasm32-unknown-unknown && \
-  cargo install cargo-audit && \
+  cargo install --locked --version 0.21.2 cargo-audit && \
   cargo install cargo-hack && \
   cargo install cargo-sort && \
   cargo install mdbook && \
@@ -103,3 +104,7 @@ RUN apt-get update && \
   chmod -R a+w /.npm && \
   # clean lists
   rm -rf /var/lib/apt/lists/*
+
+COPY build-openssl.sh /tmp/build-openssl.sh
+RUN bash /tmp/build-openssl.sh /opt/openssl && rm /tmp/build-openssl.sh
+ENV OPENSSL_DIR=/opt/openssl OPENSSL_STATIC=1

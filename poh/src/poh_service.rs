@@ -153,7 +153,7 @@ impl PohService {
         // Account for some extra time outside of PoH generation to account
         // for processing time outside PoH.
         let adjustment_per_tick = if ticks_per_slot > 0 {
-            TARGET_SLOT_ADJUSTMENT_NS / ticks_per_slot
+            (TARGET_SLOT_ADJUSTMENT_NS / ticks_per_slot).min(target_tick_duration_ns / 8)
         } else {
             0
         };
@@ -394,6 +394,17 @@ mod tests {
         solana_sdk::{clock, hash::hash, timing, transaction::VersionedTransaction},
         std::{thread::sleep, time::Duration},
     };
+
+    #[test]
+    fn test_target_ns_per_tick() {
+        // Preserve the legacy 400 ms slot pacing.
+        assert_eq!(PohService::target_ns_per_tick(64, 6_250_000), 5_468_750);
+        // A fixed 50 ms reserve must not disable pacing for 32 ms slots.
+        assert_eq!(PohService::target_ns_per_tick(64, 500_000), 437_500);
+        assert_eq!(PohService::target_ns_per_tick(0, 500_000), 500_000);
+        assert_eq!(PohService::target_ns_per_tick(64, 0), 0);
+        assert_eq!(PohService::target_ns_per_tick(64, 1), 1);
+    }
 
     #[test]
     #[ignore]

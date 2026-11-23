@@ -1,7 +1,6 @@
 //! The `rpc` module implements the Solana RPC interface.
 use std::thread::{sleep, Builder};
 use std::time::Instant;
-use crossbeam_channel::{bounded};
 use {
     crate::{
         max_slots::MaxSlots, optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
@@ -9,7 +8,7 @@ use {
     },
     base64::{prelude::BASE64_STANDARD, Engine},
     bincode::{config::Options, serialize},
-    crossbeam_channel::{unbounded, Receiver, Sender},
+    crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError},
     jsonrpc_core::{futures::future, types::error, BoxFuture, Error, Metadata, Result},
     jsonrpc_derive::rpc,
     solana_account_decoder::{
@@ -110,13 +109,11 @@ use {
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, Mutex, RwLock,
+            Arc, RwLock,
         },
         time::Duration,
     },
 };
-use solana_measure::measure::Measure;
-use solana_sdk::clock::DEFAULT_MS_PER_SLOT;
 
 pub mod account_resolver;
 
@@ -124,6 +121,7 @@ type RpcCustomResult<T> = std::result::Result<T, RpcCustomError>;
 
 pub const MAX_REQUEST_BODY_SIZE: usize = 50 * (1 << 10); // 50kB
 pub const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
+const SEND_TRANSACTION_QUEUE_CAPACITY: usize = 1024;
 
 fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
     RpcResponse {
@@ -207,7 +205,7 @@ pub struct JsonRpcRequestProcessor {
     cluster_info: Arc<ClusterInfo>,
     genesis_hash: Hash,
     transaction_latency_sender: Sender<Signature>,
-    transaction_sender: Arc<Mutex<Sender<TransactionInfo>>>,
+    transaction_sender: Sender<TransactionInfo>,
     bigtable_ledger_storage: Option<solana_storage_bigtable::LedgerStorage>,
     optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
     largest_accounts_cache: Arc<RwLock<LargestAccountsCache>>,
@@ -326,42 +324,45 @@ impl JsonRpcRequestProcessor {
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         rpc_tx_sender: Sender<SanitizedTransaction>,
     ) -> (Self, Receiver<TransactionInfo>) {
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = bounded(SEND_TRANSACTION_QUEUE_CAPACITY);
         let (transaction_latency_sender, latency_receiver) = bounded::<Signature>(0);
         Builder::new()
             .name("measureTxLatency".to_string())
             .spawn({
                 let optimistically_confirmed_bank = optimistically_confirmed_bank.clone();
-                move || {
-                    loop {
-                        match latency_receiver.recv() {
-                            Ok(sig) => {
-                                let recv_time = Instant::now();
-                                loop {
-                                    let bank = match optimistically_confirmed_bank.try_read() {
-                                        Ok(b) => b.bank.clone(),
-                                        Err(_) => continue,
-                                    };
+                move || loop {
+                    match latency_receiver.recv() {
+                        Ok(sig) => {
+                            let recv_time = Instant::now();
+                            loop {
+                                let bank = match optimistically_confirmed_bank.try_read() {
+                                    Ok(b) => b.bank.clone(),
+                                    Err(_) => continue,
+                                };
 
-                                    let status_slot = bank.get_signature_status_slot(&sig);
+                                let status_slot = bank.get_signature_status_slot(&sig);
 
-                                    if let Some(_) = status_slot {
-                                        let latency = recv_time.elapsed().as_millis();
-                                        datapoint_info!("tx-latency", ("latency", latency as i64, i64), ("txid", sig.to_string(), String));
-                                        break;
-                                    }
-
-                                    if recv_time.elapsed().as_millis() > 10000 {
-                                        break;
-                                    }
-                                    sleep(Duration::from_millis(1));
+                                if let Some(_) = status_slot {
+                                    let latency = recv_time.elapsed().as_millis();
+                                    datapoint_info!(
+                                        "tx-latency",
+                                        ("latency", latency as i64, i64),
+                                        ("txid", sig.to_string(), String)
+                                    );
+                                    break;
                                 }
-                            },
-                            Err(_) => break,
+
+                                if recv_time.elapsed().as_millis() > 10000 {
+                                    break;
+                                }
+                                sleep(Duration::from_millis(1));
+                            }
                         }
+                        Err(_) => break,
                     }
                 }
-            }).expect("measureTxLatency thread to be spawned");
+            })
+            .expect("measureTxLatency thread to be spawned");
         (
             Self {
                 config,
@@ -373,7 +374,7 @@ impl JsonRpcRequestProcessor {
                 health,
                 cluster_info,
                 genesis_hash,
-                transaction_sender: Arc::new(Mutex::new(sender)),
+                transaction_sender: sender,
                 bigtable_ledger_storage,
                 optimistically_confirmed_bank,
                 largest_accounts_cache,
@@ -395,8 +396,6 @@ impl JsonRpcRequestProcessor {
         socket_addr_space: SocketAddrSpace,
         connection_cache: Arc<ConnectionCache>,
     ) -> Self {
-        unimplemented!();
-        /*
         let genesis_hash = bank.hash();
         let bank_forks = BankForks::new_rw_arc(bank);
         let bank = bank_forks.read().unwrap().root_bank();
@@ -414,7 +413,7 @@ impl JsonRpcRequestProcessor {
             .my_contact_info()
             .tpu(connection_cache.protocol())
             .unwrap();
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = bounded(SEND_TRANSACTION_QUEUE_CAPACITY);
         SendTransactionService::new::<NullTpuInfo>(
             tpu_address,
             &bank_forks,
@@ -431,6 +430,8 @@ impl JsonRpcRequestProcessor {
         let slot = bank.slot();
         let optimistically_confirmed_bank =
             Arc::new(RwLock::new(OptimisticallyConfirmedBank { bank }));
+        let (transaction_latency_sender, _transaction_latency_receiver) = bounded(0);
+        let (rpc_tx_sender, _rpc_tx_receiver) = unbounded();
         Self {
             config: JsonRpcConfig::default(),
             snapshot_config: None,
@@ -451,7 +452,8 @@ impl JsonRpcRequestProcessor {
             )),
             cluster_info,
             genesis_hash,
-            transaction_sender: Arc::new(Mutex::new(sender)),
+            transaction_latency_sender,
+            transaction_sender: sender,
             bigtable_ledger_storage: None,
             optimistically_confirmed_bank,
             largest_accounts_cache: Arc::new(RwLock::new(LargestAccountsCache::new(30))),
@@ -460,9 +462,8 @@ impl JsonRpcRequestProcessor {
             max_complete_transaction_status_slot: Arc::new(AtomicU64::default()),
             max_complete_rewards_slot: Arc::new(AtomicU64::default()),
             prioritization_fee_cache: Arc::new(PrioritizationFeeCache::default()),
+            rpc_tx_sender,
         }
-
-         */
     }
 
     pub fn get_account_info(
@@ -2518,7 +2519,7 @@ fn get_token_program_id_and_mint(
 }
 
 fn _send_transaction(
-    meta: JsonRpcRequestProcessor,
+    meta: &JsonRpcRequestProcessor,
     signature: Signature,
     wire_transaction: Vec<u8>,
     last_valid_block_height: u64,
@@ -2534,12 +2535,13 @@ fn _send_transaction(
         None,
     );
     meta.transaction_sender
-        .lock()
-        .unwrap()
-        .send(transaction_info)
-        .map_err(|err| {
-            warn!("Failed to enqueue transaction: {}", err);
-            Error::internal_error()
+        .try_send(transaction_info)
+        .map_err(|err| match err {
+            TrySendError::Full(_) => RpcCustomError::SendTransactionQueueFull.into(),
+            TrySendError::Disconnected(_) => {
+                warn!("Transaction forwarding service disconnected");
+                Error::internal_error()
+            }
         })?;
 
     Ok(signature.to_string())
@@ -3624,7 +3626,7 @@ pub mod rpc_full {
             };
 
             _send_transaction(
-                meta,
+                &meta,
                 signature,
                 wire_transaction,
                 last_valid_block_height,
@@ -3746,7 +3748,7 @@ pub mod rpc_full {
             // Keep forwarding and retries independent of the local leader window,
             // a full fast-path queue, and retryable direct-execution failures.
             let signature = _send_transaction(
-                meta.clone(),
+                &meta,
                 signature,
                 wire_transaction,
                 last_valid_block_height,
@@ -4745,6 +4747,7 @@ pub mod tests {
         solana_rpc_client_api::{
             custom_error::{
                 JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+                JSON_RPC_SERVER_ERROR_SEND_TRANSACTION_QUEUE_FULL,
                 JSON_RPC_SERVER_ERROR_TRANSACTION_HISTORY_NOT_AVAILABLE,
                 JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION,
             },
@@ -4913,6 +4916,7 @@ pub mod tests {
                 max_complete_transaction_status_slot.clone(),
                 max_complete_rewards_slot,
                 Arc::new(PrioritizationFeeCache::default()),
+                unbounded().0,
             )
             .0;
 
@@ -6864,6 +6868,56 @@ pub mod tests {
     }
 
     #[test]
+    fn test_rpc_send_transaction_rejects_full_forwarding_queue() {
+        let mut handler = RpcHandler::start();
+        assert_eq!(
+            handler.meta.transaction_sender.capacity(),
+            Some(SEND_TRANSACTION_QUEUE_CAPACITY)
+        );
+        let (forward_sender, forward_receiver) = bounded(1);
+        let (direct_sender, direct_receiver) = bounded(1);
+        handler.meta.transaction_sender = forward_sender;
+        handler.meta.rpc_tx_sender = direct_sender;
+
+        let tx = system_transaction::transfer(
+            &handler.mint_keypair,
+            &Pubkey::new_unique(),
+            1,
+            handler.working_bank().last_blockhash(),
+        );
+        let signature = tx.signatures[0];
+        let request = create_test_request(
+            "sendTransaction",
+            Some(json!([
+                BASE64_STANDARD.encode(serialize(&tx).unwrap()),
+                { "encoding": "base64", "skipPreflight": true }
+            ])),
+        );
+
+        assert_eq!(
+            parse_success_result::<String>(handler.handle_request_sync(request.clone())),
+            signature.to_string()
+        );
+        assert_eq!(direct_receiver.try_recv().unwrap().signature(), &signature);
+        assert_eq!(
+            parse_failure_response(handler.handle_request_sync(request.clone())),
+            (
+                JSON_RPC_SERVER_ERROR_SEND_TRANSACTION_QUEUE_FULL,
+                "Transaction submission queue is full. Try again later.".to_string()
+            )
+        );
+        assert!(direct_receiver.is_empty());
+        assert_eq!(forward_receiver.try_recv().unwrap().signature, signature);
+
+        assert_eq!(
+            parse_success_result::<String>(handler.handle_request_sync(request)),
+            signature.to_string()
+        );
+        assert_eq!(forward_receiver.try_recv().unwrap().signature, signature);
+        assert_eq!(direct_receiver.try_recv().unwrap().signature(), &signature);
+    }
+
+    #[test]
     fn test_rpc_send_transaction_preflight() {
         let exit = Arc::new(AtomicBool::new(false));
         let validator_exit = create_validator_exit(exit.clone());
@@ -6913,6 +6967,7 @@ pub mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
+            unbounded().0,
         );
         SendTransactionService::new::<NullTpuInfo>(
             tpu_address,
@@ -6997,8 +7052,7 @@ pub mod tests {
             )
         );
 
-        // sendTransaction will now succeed because skipPreflight=true even though it's a bad
-        // transaction
+        // skipPreflight bypasses simulation, but must never bypass signature verification.
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{}", {{"skipPreflight": true}}]}}"#,
             bs58::encode(serialize(&bad_transaction).unwrap()).into_string()
@@ -7007,7 +7061,7 @@ pub mod tests {
         assert_eq!(
             res,
             Some(
-                r#"{"jsonrpc":"2.0","result":"1111111111111111111111111111111111111111111111111111111111111111","id":1}"#.to_string(),
+                r#"{"jsonrpc":"2.0","error":{"code":-32003,"message":"Transaction signature verification failure"},"id":1}"#.to_string(),
             )
         );
 
@@ -7187,6 +7241,7 @@ pub mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
+            unbounded().0,
         );
         SendTransactionService::new::<NullTpuInfo>(
             tpu_address,
@@ -8819,6 +8874,7 @@ pub mod tests {
             max_complete_transaction_status_slot,
             max_complete_rewards_slot,
             Arc::new(PrioritizationFeeCache::default()),
+            unbounded().0,
         );
 
         let mut io = MetaIoHandler::default();

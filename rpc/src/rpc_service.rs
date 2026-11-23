@@ -1,6 +1,7 @@
 //! The `rpc_service` module implements the Solana JSON RPC service.
 
 use crossbeam_channel::Sender;
+use solana_sdk::transaction::SanitizedTransaction;
 use {
     crate::{
         cluster_tpu_info::ClusterTpuInfo,
@@ -54,7 +55,6 @@ use {
     },
     tokio_util::codec::{BytesCodec, FramedRead},
 };
-use solana_sdk::transaction::SanitizedTransaction;
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
 const INCREMENTAL_SNAPSHOT_REQUEST_PATH: &str = "/incremental-snapshot.tar.bz2";
@@ -659,6 +659,7 @@ mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
+            crossbeam_channel::unbounded().0,
         )
         .expect("assume successful JsonRpcService start");
         let thread = rpc_service.thread_hdl.thread();

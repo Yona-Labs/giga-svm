@@ -24,6 +24,7 @@ pub const JSON_RPC_SERVER_ERROR_TRANSACTION_SIGNATURE_LEN_MISMATCH: i64 = -32013
 pub const JSON_RPC_SERVER_ERROR_BLOCK_STATUS_NOT_AVAILABLE_YET: i64 = -32014;
 pub const JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION: i64 = -32015;
 pub const JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED: i64 = -32016;
+pub const JSON_RPC_SERVER_ERROR_SEND_TRANSACTION_QUEUE_FULL: i64 = -32050;
 
 #[derive(Error, Debug)]
 pub enum RpcCustomError {
@@ -37,6 +38,8 @@ pub enum RpcCustomError {
         message: String,
         result: RpcSimulateTransactionResult,
     },
+    #[error("SendTransactionQueueFull")]
+    SendTransactionQueueFull,
     #[error("TransactionSignatureVerificationFailure")]
     TransactionSignatureVerificationFailure,
     #[error("BlockNotAvailable")]
@@ -108,6 +111,11 @@ impl From<RpcCustomError> for Error {
                 ),
                 message,
                 data: Some(serde_json::json!(result)),
+            },
+            RpcCustomError::SendTransactionQueueFull => Self {
+                code: ErrorCode::ServerError(JSON_RPC_SERVER_ERROR_SEND_TRANSACTION_QUEUE_FULL),
+                message: "Transaction submission queue is full. Try again later.".to_string(),
+                data: None,
             },
             RpcCustomError::TransactionSignatureVerificationFailure => Self {
                 code: ErrorCode::ServerError(

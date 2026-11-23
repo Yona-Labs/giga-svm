@@ -2847,7 +2847,7 @@ mod tests {
     fn test_poh_speed() {
         solana_logger::setup();
         let poh_config = PohConfig {
-            target_tick_duration: Duration::from_millis(solana_sdk::clock::MS_PER_TICK),
+            target_tick_duration: Duration::from_micros(solana_sdk::clock::US_PER_TICK),
             // make PoH rate really fast to cause the panic condition
             hashes_per_tick: Some(100 * solana_sdk::clock::DEFAULT_HASHES_PER_TICK),
             ..PohConfig::default()
@@ -2862,7 +2862,7 @@ mod tests {
     #[test]
     fn test_poh_speed_no_hashes_per_tick() {
         let poh_config = PohConfig {
-            target_tick_duration: Duration::from_millis(solana_sdk::clock::MS_PER_TICK),
+            target_tick_duration: Duration::from_micros(solana_sdk::clock::US_PER_TICK),
             hashes_per_tick: None,
             ..PohConfig::default()
         };

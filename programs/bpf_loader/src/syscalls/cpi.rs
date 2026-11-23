@@ -2778,43 +2778,28 @@ mod tests {
     }
 
     fn mock_signers(signers: &[&[u8]], vm_addr: u64) -> (Vec<u8>, MemoryRegion) {
-        let slice_size = mem::size_of::<&[()]>();
-        let size = signers
-            .iter()
-            .fold(slice_size, |size, signer| size + slice_size + signer.len());
+        // Encode the guest's pointer/length pairs without creating host
+        // references to guest virtual addresses.
+        let slice_size = mem::size_of::<[u64; 2]>();
+        let descriptors_size = slice_size * (signers.len() + 1);
+        let data_size = signers.iter().map(|signer| signer.len()).sum::<usize>();
+        let mut data = Vec::with_capacity(descriptors_size + data_size);
+        let slices_addr = vm_addr + slice_size as u64;
+        data.extend_from_slice(&slices_addr.to_ne_bytes());
+        data.extend_from_slice(&(signers.len() as u64).to_ne_bytes());
 
-        let vm_addr = vm_addr as usize;
-        let mut slices_addr = vm_addr + slice_size;
-
-        let mut data = vec![0; size];
-        unsafe {
-            ptr::write_unaligned(
-                data.as_mut_ptr().cast(),
-                slice::from_raw_parts::<&[&[u8]]>(slices_addr as *const _, signers.len()),
-            );
-        }
-
-        let mut signers_addr = slices_addr + signers.len() * slice_size;
-
+        let mut seed_addr = vm_addr + descriptors_size as u64;
         for signer in signers {
-            unsafe {
-                ptr::write_unaligned(
-                    (data.as_mut_ptr() as usize + slices_addr - vm_addr) as *mut _,
-                    slice::from_raw_parts::<&[u8]>(signers_addr as *const _, signer.len()),
-                );
-            }
-            slices_addr += slice_size;
-            signers_addr += signer.len();
+            let len = signer.len() as u64;
+            data.extend_from_slice(&seed_addr.to_ne_bytes());
+            data.extend_from_slice(&len.to_ne_bytes());
+            seed_addr += len;
         }
-
-        let slices_addr = vm_addr + slice_size;
-        let mut signers_addr = slices_addr + signers.len() * slice_size;
         for signer in signers {
-            data[signers_addr - vm_addr..][..signer.len()].copy_from_slice(signer);
-            signers_addr += signer.len();
+            data.extend_from_slice(signer);
         }
 
-        let region = MemoryRegion::new_writable(data.as_mut_slice(), vm_addr as u64);
+        let region = MemoryRegion::new_writable(data.as_mut_slice(), vm_addr);
         (data, region)
     }
 

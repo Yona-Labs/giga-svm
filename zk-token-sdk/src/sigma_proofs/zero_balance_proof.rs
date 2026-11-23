@@ -83,10 +83,13 @@ impl ZeroBalanceProof {
         transcript.append_point(b"Y_D", &Y_D);
 
         let c = transcript.challenge_scalar(b"c");
-        transcript.challenge_scalar(b"w");
 
         // compute the masked secret key
         let z = &(&c * s) + &y;
+
+        // compute challenge `w` for consistency with verification
+        transcript.append_scalar(b"z", &z);
+        transcript.challenge_scalar(b"w");
 
         // zeroize random scalar
         y.zeroize();
@@ -117,6 +120,8 @@ impl ZeroBalanceProof {
         transcript.append_point(b"Y_D", &self.Y_D);
 
         let c = transcript.challenge_scalar(b"c");
+
+        transcript.append_scalar(b"z", &self.z);
         let w = transcript.challenge_scalar(b"w"); // w used for batch verification
 
         let w_negated = -&w;

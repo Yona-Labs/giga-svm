@@ -5,8 +5,15 @@ use {
     },
     crossbeam_channel::Sender,
     pem::Pem,
-    quinn::{Endpoint, IdleTimeout, ServerConfig},
-    rustls::{server::ClientCertVerified, Certificate, DistinguishedName},
+    quinn::{
+        crypto::rustls::{NoInitialCipherSuite, QuicServerConfig},
+        Endpoint, IdleTimeout, ServerConfig,
+    },
+    rustls::{
+        pki_types::{CertificateDer, UnixTime},
+        server::danger::ClientCertVerified,
+        DistinguishedName,
+    },
     solana_perf::packet::PacketBatch,
     solana_sdk::{
         packet::PACKET_DATA_SIZE,
@@ -20,7 +27,7 @@ use {
             Arc, RwLock,
         },
         thread,
-        time::{Duration, SystemTime},
+        time::Duration,
     },
     tokio::runtime::Runtime,
 };
@@ -28,11 +35,12 @@ use {
 pub const MAX_STAKED_CONNECTIONS: usize = 2000;
 pub const MAX_UNSTAKED_CONNECTIONS: usize = 500;
 
-pub struct SkipClientVerification;
+#[derive(Debug)]
+pub struct SkipClientVerification(Arc<rustls::crypto::CryptoProvider>);
 
 impl SkipClientVerification {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self)
+        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
     }
 }
 
@@ -42,18 +50,58 @@ pub struct SpawnServerResult {
     pub key_updater: Arc<EndpointKeyUpdater>,
 }
 
-impl rustls::server::ClientCertVerifier for SkipClientVerification {
-    fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
+impl rustls::server::danger::ClientCertVerifier for SkipClientVerification {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &[]
     }
 
     fn verify_client_cert(
         &self,
-        _end_entity: &Certificate,
-        _intermediates: &[Certificate],
-        _now: SystemTime,
+        _end_entity: &CertificateDer,
+        _intermediates: &[CertificateDer],
+        _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        Ok(rustls::server::ClientCertVerified::assertion())
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
     }
 }
 
@@ -67,19 +115,18 @@ pub(crate) fn configure_server(
     let (cert, priv_key) = new_self_signed_tls_certificate(identity_keypair, gossip_host)?;
     let cert_chain_pem_parts = vec![Pem {
         tag: "CERTIFICATE".to_string(),
-        contents: cert.0.clone(),
+        contents: cert.as_ref().to_vec(),
     }];
     let cert_chain_pem = pem::encode_many(&cert_chain_pem_parts);
 
     let mut server_tls_config = rustls::ServerConfig::builder()
-        .with_safe_defaults()
         .with_client_cert_verifier(SkipClientVerification::new())
         .with_single_cert(vec![cert], priv_key)?;
     server_tls_config.alpn_protocols = vec![ALPN_TPU_PROTOCOL_ID.to_vec()];
 
-    let mut server_config = ServerConfig::with_crypto(Arc::new(server_tls_config));
-    server_config.concurrent_connections(max_concurrent_connections as u32);
-    server_config.use_retry(true);
+    let quic_server_config = QuicServerConfig::try_from(server_tls_config)?;
+    let mut server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));
+    server_config.max_incoming(max_concurrent_connections);
     let config = Arc::get_mut(&mut server_config.transport).unwrap();
 
     // QUIC_MAX_CONCURRENT_STREAMS doubled, which was found to improve reliability
@@ -115,6 +162,8 @@ pub enum QuicServerError {
     CertificateError(#[from] rcgen::RcgenError),
     #[error("TLS error: {0}")]
     TlsError(#[from] rustls::Error),
+    #[error("No initial cipher suite")]
+    NoInitialCipherSuite(#[from] NoInitialCipherSuite),
 }
 
 pub struct EndpointKeyUpdater {
@@ -134,6 +183,7 @@ impl NotifyKeyUpdate for EndpointKeyUpdater {
 #[derive(Default)]
 pub struct StreamStats {
     pub(crate) total_connections: AtomicUsize,
+    pub(crate) total_connection_retries: AtomicUsize,
     pub(crate) total_new_connections: AtomicUsize,
     pub(crate) total_streams: AtomicUsize,
     pub(crate) total_new_streams: AtomicUsize,
@@ -191,6 +241,11 @@ impl StreamStats {
             (
                 "active_connections",
                 self.total_connections.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "total_connection_retries",
+                self.total_connection_retries.load(Ordering::Relaxed),
                 i64
             ),
             (
@@ -523,6 +578,7 @@ mod test {
             test::*, DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
         },
         crossbeam_channel::unbounded,
+        quinn_proto::{transport_parameters::TransportParameters, Side},
         solana_sdk::net::DEFAULT_TPU_COALESCE,
         std::net::SocketAddr,
     };
@@ -561,6 +617,14 @@ mod test {
         )
         .unwrap();
         (t, exit, receiver, server_address)
+    }
+
+    #[test]
+    fn test_malformed_transport_parameter_is_rejected() {
+        // max_idle_timeout with a truncated two-byte varint used to panic the
+        // TPU process during transport-parameter parsing.
+        let bytes = [0x05, 0x01, 0x40];
+        assert!(TransportParameters::read(Side::Client, &mut &bytes[..]).is_err());
     }
 
     #[test]
